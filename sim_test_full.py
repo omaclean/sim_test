@@ -3,6 +3,7 @@ import os
 import numpy as np
 import simulation_lib as sim
 import matplotlib.pyplot as plt
+import pandas as pd
 
 def run_simulation(args):
     # Ensure output directory exists
@@ -26,11 +27,14 @@ def run_simulation(args):
         'MEAN_INCUBATION': 3,
         'MEAN_RECOVERY': 10,
         'SAMPLE_LAG_MEAN': 4,
-        'PROB_DETECT_SEQUENCE': 0.4,
-        'HCW_CROSS_WARD_PROB': 0.1
+        'PROB_DETECT': args.prob_detect,
+        'PROB_SEQ': args.prob_seq,
+        'HCW_CROSS_WARD_PROB': 0.1,
+        'ISOLATION_CAPACITY': args.isolation_capacity,
+        'GENETIC_LINK_THRESHOLD': 1 # SNPs
     }
     
-    hospital = sim.Hospital(params['N_WARDS'], params['N_PATIENTS'], params['N_HCW'])
+    hospital = sim.Hospital(params['N_WARDS'], params['N_PATIENTS'], params['N_HCW'], isolation_capacity=params['ISOLATION_CAPACITY'])
     tracker = sim.PhylogenyTracker(
         params['GENOME_LENGTH'], 
         params['MUTATION_RATE'], 
@@ -40,18 +44,22 @@ def run_simulation(args):
     )
     
     history = []
+    known_sequences = [] # List of (agent, node_id)
     
     print(f"Starting Simulation: {params['N_PATIENTS']+params['N_HCW']} Agents, {params['SIMULATION_DAYS']} Days.")
     
     for day in range(params['SIMULATION_DAYS']):
-        # 0. Evolve Community
+        # 0. Discharge / De-isolate
+        for a in hospital.agents:
+            if a.status == 'R' and a.is_isolated:
+                hospital.discharge_patient(a)
+                
+        # 1. Evolve Community
         tracker.step_community(day)
 
-        # 1. Importation Events
+        # 2. Importation Events
         if np.random.random() < params['IMPORTATION_DAILY_PROB']:
             # Pick a random agent from the ENTIRE population
-            # If they are not susceptible, the importation "fails" (bounces off).
-            # This ensures importation rate scales with the susceptible proportion.
             target = np.random.choice(hospital.agents)
             
             if target.status == 'S':
@@ -63,7 +71,7 @@ def run_simulation(args):
                 node_id = tracker.add_importation(day, variant)
                 target.infected_by_node = node_id
 
-        # 2. Contact & Transmission
+        # 3. Contact & Transmission
         contacts = hospital.get_contacts(day_seed=day, params=params)
         new_infections = []
         
@@ -89,24 +97,48 @@ def run_simulation(args):
             target.infected_by_node = new_node
             source.infected_by_node = updated_source_node
 
-        # 3. Clinical Progression & Sampling
+        # 4. Clinical Progression, Sampling & Infection Control
         for a in hospital.agents:
             if a.status == 'I':
                 if not a.is_sampled:
                     if day >= a.symptom_time:
-                         if np.random.random() < params['PROB_DETECT_SEQUENCE']:
+                         # Detection Check
+                         if np.random.random() < params['PROB_DETECT']:
                              sample_date = a.symptom_time + np.random.poisson(params['SAMPLE_LAG_MEAN'])
                              if day >= sample_date:
-                                 sample_node, updated_node = tracker.add_sample(a.infected_by_node, day)
-                                 a.is_sampled = True
-                                 a.sample_node = sample_node
-                                 a.infected_by_node = updated_node
-                                 a.sample_time = day
+                                 # Sequencing Check
+                                 if np.random.random() < params['PROB_SEQ']:
+                                     sample_node, updated_node = tracker.add_sample(a.infected_by_node, day)
+                                     a.is_sampled = True
+                                     a.sample_node = sample_node
+                                     a.infected_by_node = updated_node
+                                     a.sample_time = day
+                                     
+                                     # --- REAL-TIME INFECTION CONTROL ---
+                                     # Compare with known sequences to infer links
+                                     linked = False
+                                     for known_agent, known_node in known_sequences:
+                                         dist = tracker.get_pairwise_distance(sample_node, known_node)
+                                         if dist <= params['GENETIC_LINK_THRESHOLD']:
+                                             linked = True
+                                             # Isolate the known contact if still active
+                                             if known_agent.status == 'I':
+                                                 hospital.try_isolate_patient(known_agent, day)
+                                     
+                                     if linked:
+                                         hospital.try_isolate_patient(a, day)
+                                         
+                                     known_sequences.append((a, sample_node))
+                                 else:
+                                     # Detected but not sequenced - no genetic info, no isolation based on linkage
+                                     pass
                 
                 if day > a.infection_time + params['MEAN_RECOVERY']:
                     a.status = 'R'
+                    if a.is_isolated:
+                        hospital.discharge_patient(a)
 
-        # 4. Data Logging
+        # 5. Data Logging
         # We track the state of the epidemic daily.
         s_count = sum(1 for a in hospital.agents if a.status == 'S')
         i_count = sum(1 for a in hospital.agents if a.status == 'I')
@@ -121,11 +153,15 @@ def run_simulation(args):
         i_hcw = sum(1 for a in hospital.agents if a.status == 'I' and a.role == 'HCW')
         r_hcw = sum(1 for a in hospital.agents if a.status == 'R' and a.role == 'HCW')
         
+        # Track Isolation
+        n_iso = hospital.n_isolated
+        
         history.append({
             'day': day, 
             'S': s_count, 'I': i_count, 'R': r_count,
             'S_pat': s_pat, 'I_pat': i_pat, 'R_pat': r_pat,
-            'S_hcw': s_hcw, 'I_hcw': i_hcw, 'R_hcw': r_hcw
+            'S_hcw': s_hcw, 'I_hcw': i_hcw, 'R_hcw': r_hcw,
+            'Isolated': n_iso
         })
         
     # ==========================================
@@ -170,6 +206,9 @@ if __name__ == "__main__":
     parser.add_argument("--n-patients", type=int, default=700, help="Number of patients")
     parser.add_argument("--n-hcw", type=int, default=300, help="Number of HCWs")
     parser.add_argument("--n-wards", type=int, default=10, help="Number of wards")
+    parser.add_argument("--prob-detect", type=float, default=0.4, help="Probability of detecting a case")
+    parser.add_argument("--prob-seq", type=float, default=1.0, help="Probability of sequencing a detected case")
+    parser.add_argument("--isolation-capacity", type=int, default=20, help="Number of isolation rooms available")
     
     args = parser.parse_args()
     run_simulation(args)
