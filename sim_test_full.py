@@ -49,9 +49,12 @@ def run_simulation(args):
 
         # 1. Importation Events
         if np.random.random() < params['IMPORTATION_DAILY_PROB']:
-            susceptibles = [a for a in hospital.agents if a.status == 'S']
-            if susceptibles:
-                target = np.random.choice(susceptibles)
+            # Pick a random agent from the ENTIRE population
+            # If they are not susceptible, the importation "fails" (bounces off).
+            # This ensures importation rate scales with the susceptible proportion.
+            target = np.random.choice(hospital.agents)
+            
+            if target.status == 'S':
                 target.status = 'I'
                 target.infection_time = day
                 target.symptom_time = day + np.random.poisson(params['MEAN_INCUBATION'])
