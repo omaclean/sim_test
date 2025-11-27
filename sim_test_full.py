@@ -104,25 +104,52 @@ def run_simulation(args):
                     a.status = 'R'
 
         # 4. Data Logging
+        # We track the state of the epidemic daily.
         s_count = sum(1 for a in hospital.agents if a.status == 'S')
         i_count = sum(1 for a in hospital.agents if a.status == 'I')
         r_count = sum(1 for a in hospital.agents if a.status == 'R')
-        history.append({'day': day, 'S': s_count, 'I': i_count, 'R': r_count})
+        
+        # Split by Role for detailed analysis
+        s_pat = sum(1 for a in hospital.agents if a.status == 'S' and a.role == 'PATIENT')
+        i_pat = sum(1 for a in hospital.agents if a.status == 'I' and a.role == 'PATIENT')
+        r_pat = sum(1 for a in hospital.agents if a.status == 'R' and a.role == 'PATIENT')
+        
+        s_hcw = sum(1 for a in hospital.agents if a.status == 'S' and a.role == 'HCW')
+        i_hcw = sum(1 for a in hospital.agents if a.status == 'I' and a.role == 'HCW')
+        r_hcw = sum(1 for a in hospital.agents if a.status == 'R' and a.role == 'HCW')
+        
+        history.append({
+            'day': day, 
+            'S': s_count, 'I': i_count, 'R': r_count,
+            'S_pat': s_pat, 'I_pat': i_pat, 'R_pat': r_pat,
+            'S_hcw': s_hcw, 'I_hcw': i_hcw, 'R_hcw': r_hcw
+        })
         
     # ==========================================
     # 5. EXPORT & FINALIZATION
     # ==========================================
     
+    # A. Plot Epidemic Curves
     sim.save_sir_curves(history, args.output_dir)
     print(f"Saved sir_curves.png to {args.output_dir}")
+    
+    sim.save_recovered_split(history, args.output_dir)
+    print(f"Saved recovered_split.png to {args.output_dir}")
 
+    # B. Finalize Phylogeny
+    # This converts the recorded nodes and edges into a tskit TreeSequence.
+    # It also simulates mutations along the branches.
     ts = tracker.finalize_tree(max_time=params['SIMULATION_DAYS'])
     ts.dump(os.path.join(args.output_dir, "hospital_outbreak.trees"))
     print(f"Saved hospital_outbreak.trees to {args.output_dir}")
 
+    # C. Extract Genetic Data
+    # Convert the tree structure into a CSV of mutations per patient.
     sim.save_mutations_csv(ts, hospital, args.output_dir)
     print(f"Saved mutations_per_patient.csv to {args.output_dir}")
 
+    # D. Generate FASTA Sequences
+    # Reconstruct full genome sequences for each sample from the tree.
     sim.save_fasta(ts, hospital, args.output_dir)
     print(f"Saved sampled_sequences.fasta to {args.output_dir}")
 

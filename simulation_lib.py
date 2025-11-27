@@ -38,6 +38,13 @@ class Agent:
 
 class Hospital:
     def __init__(self, n_wards, n_patients, n_hcw):
+        if n_wards <= 0:
+            raise ValueError(f"n_wards must be positive, got {n_wards}")
+        if n_patients < 0:
+            raise ValueError(f"n_patients must be non-negative, got {n_patients}")
+        if n_hcw < 0:
+            raise ValueError(f"n_hcw must be non-negative, got {n_hcw}")
+            
         self.wards = collections.defaultdict(list)
         self.agents = []
         self.n_wards = n_wards
@@ -114,49 +121,99 @@ class Hospital:
 # ==========================================
 
 class PhylogenyTracker:
-    def __init__(self, genome_length, mutation_rate, community_diversity_level, num_community_lineages, community_pop_size):
+    """
+    Manages the viral phylogeny using tskit.
+    
+    This class simulates the evolution of the virus across the transmission network.
+    It uses a 'forward-time' simulation approach where nodes are added as infections occur.
+    
+    Key Concepts:
+    1. **Forward Time**: We simulate from Day 0 to Day N. tskit nodes are created with 'birth time' = current day.
+       However, standard tskit/coalescent theory uses 'time ago' (0 = present). 
+       We handle this conversion in `finalize_tree`.
+       
+    2. **Within-Host Evolution**: To avoid 'star phylogenies' (where all secondary infections branch from the 
+       primary infection time), we model a viral backbone within each host.
+       - When a host transmits, we update their viral lineage to the current time (creating an intermediate node).
+       - The new infection branches from this updated node.
+       - This ensures that serial infections share the evolutionary history that occurred within the host.
+       
+    3. **Community Reservoir**: We maintain a pool of background lineages to simulate importations of distinct variants.
+    """
+    def __init__(self, genome_length, mutation_rate, community_diversity_level, num_community_lineages, community_pop_size, burn_in_days=21):
         self.genome_length = genome_length
         self.mutation_rate = mutation_rate
+        
+        # Initialize tskit tables
+        # TableCollection is the mutable structure used to build the tree sequence.
         self.tables = tskit.TableCollection(sequence_length=genome_length)
         self.nodes = self.tables.nodes
         self.edges = self.tables.edges
         self.sites = self.tables.sites
         self.mutations = self.tables.mutations
         
-        # Metadata storage
-        self.metadata = [] # ID, Type, Date
+        # Metadata storage (optional, for tracking extra info if needed)
+        self.metadata = [] 
         
-        # Initialize Community Reservoir (The "Spectral Bank")
-        # List of lists: self.community_lineages[variant_idx] = [node_ids_current_generation]
+        # --- Community Reservoir Initialization ---
+        # We create a "spectral bank" of lineages to represent the diversity circulating in the community.
+        # This allows importations to introduce genetically distinct variants (e.g., Delta vs Omicron).
+        
         self.community_lineages = []
         self.num_community_lineages = num_community_lineages
         self.community_pop_size = community_pop_size
         
+        # Calculate the time depth needed to generate the desired genetic distance
+        # Distance = 2 * T * mu * L
+        # We want average distance = COMMUNITY_DIVERSITY_LEVEL * GENOME_LENGTH
         target_muts = community_diversity_level * genome_length
         muts_per_day = mutation_rate * genome_length
-        t_ago = target_muts / muts_per_day if muts_per_day > 0 else 0
+        
+        # Time ago for the Grand MRCA (Most Recent Common Ancestor) of all community lineages
+        # We add burn_in_days to ensure the MRCA is older than the start of the burn-in
+        t_ago = (target_muts / muts_per_day if muts_per_day > 0 else 0) + burn_in_days
         
         # Create Grand MRCA
-        # Time is forward. Current is 0. Ancestor is at -t_ago.
+        # This node is the root of the entire simulation.
+        # Time is negative relative to start of sim because it existed before the simulation began.
+        # flag=NODE_IS_SAMPLE: This tells tskit to treat this node as a "sample" of interest.
+        # In many analyses, we only retain the history of "sample" nodes. 
+        # Here, we mark everything as a sample to ensure we can trace back to it easily, 
+        # although strictly only the tips need to be samples for simplification.
         mrca = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=-t_ago)
         
         for i in range(num_community_lineages):
-            # Create an intermediate root for this lineage at time 0 (or slightly before to be parent)
-            lineage_root = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=-1e-8)
+            # Create an intermediate root for this specific lineage.
+            # We start this lineage 'burn_in_days' before Day 0 to allow for some initial diversity ("fuzz")
+            # to accumulate before the simulation starts.
+            lineage_start_time = -burn_in_days
+            
+            lineage_root = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=lineage_start_time - 1e-8)
             self.edges.add_row(parent=mrca, child=lineage_root, left=0, right=genome_length)
             
-            # Create initial population for this lineage at time 0
+            # Create initial population for this lineage at the start of burn-in
             current_gen = []
             for _ in range(community_pop_size):
-                u = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=0)
-                # Link to Lineage Root (NOT Grand MRCA directly)
+                u = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=lineage_start_time)
+                # Link to Lineage Root
                 self.edges.add_row(parent=lineage_root, child=u, left=0, right=genome_length)
                 current_gen.append(u)
             self.community_lineages.append(current_gen)
+            
+        # --- Burn-in Phase ---
+        # Evolve the community lineages from -burn_in_days up to Day 0.
+        # This ensures that at Day 0, the individuals in a lineage are not identical clones
+        # but have some "fuzz" (genetic variation) consistent with their population size.
+        print(f"Evolving community lineages for {burn_in_days} days of burn-in...")
+        for d in range(-burn_in_days + 1, 1): # Evolve up to Day 0
+             self.step_community(d)
 
     def step_community(self, day):
         """
-        Advance the community lineages by one generation (Wright-Fisher).
+        Advance the community lineages by one generation using a Wright-Fisher model.
+        
+        This keeps the background diversity alive and evolving throughout the simulation.
+        Each generation replaces the previous one.
         """
         rng = np.random.default_rng(day + 999) # distinct seed
         
@@ -164,17 +221,19 @@ class PhylogenyTracker:
             prev_gen = self.community_lineages[i]
             next_gen = []
             
-            # Create new generation
+            # Create new generation of size N
             for _ in range(self.community_pop_size):
-                # Pick parent uniformly at random
+                # 1. Pick parent uniformly at random from previous generation
                 parent = rng.choice(prev_gen)
                 
-                # Ensure time ordering
+                # 2. Ensure strict time ordering for tskit
+                # Child time must be > Parent time.
                 parent_time = self.nodes.time[parent]
                 child_time = day
                 if child_time <= parent_time:
                     child_time = parent_time + 1e-8
                 
+                # 3. Add new node and edge
                 child = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=child_time)
                 self.edges.add_row(parent=parent, child=child, left=0, right=self.genome_length)
                 next_gen.append(child)
@@ -183,22 +242,31 @@ class PhylogenyTracker:
 
     def add_transmission(self, source_node, time_now):
         """
-        A infects B.
-        We create a new node for the virus in B.
-        We also update the virus in A to reflect evolution up to time_now.
+        Record a transmission event: A infects B.
+        
+        To model within-host evolution correctly:
+        1. We update the source (A) by creating a new node at `time_now` that descends from their previous node.
+           This represents the virus evolving within A up to the moment of transmission.
+        2. We create a new node for the recipient (B) that descends from A's updated node.
+        
+        Returns:
+            child_node: The node ID for the virus in the recipient (B).
+            current_source_node: The updated node ID for the virus in the source (A).
         """
         parent_time = self.nodes.time[source_node]
         
         # 1. Update Source Backbone (Evolution within A)
+        # If time has passed since the source was last updated (infected or transmitted),
+        # we add a node to represent their current viral state.
         current_source_node = source_node
         if time_now > parent_time:
-             # Create intermediate node for source at time_now
              current_source_node = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=time_now)
              self.edges.add_row(parent=source_node, child=current_source_node, left=0, right=self.genome_length)
              parent_time = time_now
         
         # 2. Create Child (Virus in B)
-        # Child must be slightly younger than parent in forward time
+        # The child node represents the start of infection in B.
+        # It must be slightly younger than the parent to satisfy tskit's constraints.
         child_time = time_now
         if child_time <= parent_time:
              child_time = parent_time + 1e-8
@@ -210,40 +278,49 @@ class PhylogenyTracker:
 
     def add_importation(self, time_now, variant_idx=0):
         """
-        Infection comes from community.
-        Parent is picked from the current generation of the background lineage.
+        Record an importation event: Community -> Hospital.
+        
+        We pick a random individual from the specified community lineage to be the source.
         """
-        # Pick a background lineage
+        # Pick the background lineage (e.g., Variant A vs Variant B)
         lineage_idx = variant_idx % len(self.community_lineages)
         current_gen = self.community_lineages[lineage_idx]
         
+        # Pick a random source from the current community generation
         root = np.random.choice(current_gen)
         
-        # Root is at time_now (or slightly before). 
+        # Ensure time ordering
         parent_time = self.nodes.time[root]
         if time_now <= parent_time:
             time_now = parent_time + 1e-8
         
+        # Create the new infection node in the hospital
         child_node = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=time_now)
         self.edges.add_row(parent=root, child=child_node, left=0, right=self.genome_length)
         return child_node
 
     def add_sample(self, infected_node, sample_time):
         """
-        Patient is sequenced.
-        We create a tip node representing the sample.
-        We also update the patient's virus lineage to the sample time.
+        Record a sampling event: Patient -> Sequence.
+        
+        Similar to transmission, we update the patient's viral lineage to the time of sampling
+        before branching off the sample node. This ensures the sample reflects evolution
+        up to the sampling date.
+        
+        Returns:
+            sample_node: The node ID of the sample (tip of the tree).
+            current_node: The updated node ID for the patient.
         """
         parent_time = self.nodes.time[infected_node]
         
-        # Update Backbone
+        # 1. Update Backbone (Evolution within Patient)
         current_node = infected_node
         if sample_time > parent_time:
             current_node = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=sample_time)
             self.edges.add_row(parent=infected_node, child=current_node, left=0, right=self.genome_length)
             parent_time = sample_time
             
-        # Create Sample Tip
+        # 2. Create Sample Tip
         tip_time = sample_time
         if tip_time <= parent_time:
             tip_time = parent_time + 1e-8
@@ -255,32 +332,46 @@ class PhylogenyTracker:
     
     def finalize_tree(self, max_time):
         """
-        tskit usually expects time to be 'time ago'. 
-        Our simulation ran in forward time (0 -> max).
-        We simply invert the times: node_time = max_time - node.birth_time
+        Convert the recorded nodes and edges into a final tskit TreeSequence with mutations.
+        
+        Steps:
+        1. **Time Inversion**: Convert 'forward time' (0=start) to 'time ago' (0=end).
+           tskit expects roots to be at high time values and tips at low time values (0).
+           
+        2. **Mutation Generation**: Simulate mutations along the branches.
+           Since tskit's `sim_mutations` might not be available or flexible enough for our specific
+           needs in older versions, we manually place mutations based on branch length.
+           - Expected mutations = rate * branch_length * genome_length
+           - Number of mutations ~ Poisson(Expected)
+           - Positions are chosen uniformly at random.
+           
+        Returns:
+            ts: The final TreeSequence object.
         """
+        # 1. Invert Time
+        # Current state: time 0 = start, time max = end.
+        # Target state: time max = start (past), time 0 = end (present).
         times = self.nodes.time
         self.nodes.time = max_time - times
         
-        # Sort tables (required by tskit)
+        # Sort tables (required by tskit after modifying time/topology)
         self.tables.sort()
         
-        # Add Mutations
+        # 2. Generate Mutations
         rng = np.random.default_rng(42)
         
-        # Map position -> site_id
+        # Map position -> site_id to reuse sites if multiple mutations hit the same spot
         site_map = {}
         
-        # Generate mutations
-        generated_mutations = [] # (pos, node)
+        generated_mutations = [] # List of (position, node_id)
         node_times = self.tables.nodes.time
         
+        # Iterate over every branch (edge) in the tree
         for edge in self.tables.edges:
             parent = edge.parent
             child = edge.child
-            left = edge.left
-            right = edge.right
             
+            # Calculate branch length in time units (days)
             t_parent = node_times[parent]
             t_child = node_times[child]
             branch_len = t_parent - t_child
@@ -288,30 +379,39 @@ class PhylogenyTracker:
             if branch_len < 0: 
                 branch_len = 0
                 
-            span = right - left
+            # Calculate expected number of mutations on this branch
+            # rate is per site per day
+            span = edge.right - edge.left
             expected_muts = self.mutation_rate * branch_len * span
+            
+            # Sample number of mutations from Poisson distribution
             n_muts = rng.poisson(expected_muts)
             
             if n_muts > 0:
-                # discrete positions
-                positions = rng.integers(int(left), int(right), size=n_muts)
+                # Choose random positions for these mutations
+                positions = rng.integers(int(edge.left), int(edge.right), size=n_muts)
                 for pos in positions:
                     generated_mutations.append((pos, child))
                     
-        # Sort by position to add sites in order
+        # Sort mutations by position (required by tskit)
         generated_mutations.sort(key=lambda x: x[0])
         
+        # Add mutations to the table
         for pos, node in generated_mutations:
             if pos not in site_map:
+                # Create a site if it doesn't exist
                 site_id = self.tables.sites.add_row(position=pos, ancestral_state="A")
                 site_map[pos] = site_id
             
             site_id = site_map[pos]
+            # Add mutation at this site on the child node
+            # We assume a simple A->T model for simplicity here
             self.tables.mutations.add_row(site=site_id, node=node, derived_state="T")
             
-        # Sort again to ensure validity
+        # Sort tables again to ensure mutation validity
         self.tables.sort()
         
+        # Build the immutable TreeSequence
         ts = self.tables.tree_sequence()
         return ts
 
@@ -320,10 +420,17 @@ class PhylogenyTracker:
 # ==========================================
 
 def save_sir_curves(history, output_dir):
-    df_hist = pd.DataFrame(history)
+    if not history:
+        # Create empty dataframe with expected columns
+        df_hist = pd.DataFrame(columns=['day', 'S', 'I', 'R', 'S_pat', 'I_pat', 'R_pat', 'S_hcw', 'I_hcw', 'R_hcw'])
+    else:
+        df_hist = pd.DataFrame(history)
+        
     plt.figure(figsize=(10,6))
-    plt.plot(df_hist['day'], df_hist['I'], label='Infected', color='red')
-    plt.plot(df_hist['day'], df_hist['R'], label='Recovered', color='green')
+    if not df_hist.empty:
+        plt.plot(df_hist['day'], df_hist['S'], label='Susceptible', color='blue')
+        plt.plot(df_hist['day'], df_hist['I'], label='Infected', color='red')
+        plt.plot(df_hist['day'], df_hist['R'], label='Recovered', color='green')
     plt.title("Hospital Outbreak SIR Curve")
     plt.xlabel("Day")
     plt.ylabel("Count")
@@ -331,7 +438,50 @@ def save_sir_curves(history, output_dir):
     plt.savefig(os.path.join(output_dir, "sir_curves.png"))
     plt.close()
 
+def save_recovered_split(history, output_dir):
+    """
+    Plots the percentage of Recovered individuals, split by HCW and Patients.
+    """
+    if not history:
+        return
+        
+    df_hist = pd.DataFrame(history)
+    if df_hist.empty:
+        return
+
+    # Calculate percentages
+    # We need total counts for normalization. 
+    # Assuming constant population size for simplicity, or we can sum S+I+R at each step.
+    
+    # Total Patients = S_pat + I_pat + R_pat
+    # Total HCW = S_hcw + I_hcw + R_hcw
+    
+    df_hist['Total_Pat'] = df_hist['S_pat'] + df_hist['I_pat'] + df_hist['R_pat']
+    df_hist['Total_HCW'] = df_hist['S_hcw'] + df_hist['I_hcw'] + df_hist['R_hcw']
+    
+    # Avoid division by zero
+    df_hist['Pct_R_Pat'] = np.where(df_hist['Total_Pat'] > 0, 100 * df_hist['R_pat'] / df_hist['Total_Pat'], 0)
+    df_hist['Pct_R_HCW'] = np.where(df_hist['Total_HCW'] > 0, 100 * df_hist['R_hcw'] / df_hist['Total_HCW'], 0)
+    
+    plt.figure(figsize=(10,6))
+    plt.plot(df_hist['day'], df_hist['Pct_R_Pat'], label='Patients (Recovered %)', color='orange')
+    plt.plot(df_hist['day'], df_hist['Pct_R_HCW'], label='HCWs (Recovered %)', color='purple')
+    plt.title("Percentage Recovered by Role")
+    plt.xlabel("Day")
+    plt.ylabel("Percentage (%)")
+    plt.legend()
+    plt.ylim(0, 100)
+    plt.savefig(os.path.join(output_dir, "recovered_split.png"))
+    plt.close()
+
 def save_mutations_csv(ts, hospital, output_dir):
+    """
+    Extracts mutations from the TreeSequence and saves them to a CSV.
+    
+    This is where the 'tree' representation is converted into 'genotype' data.
+    The TreeSequence contains the full evolutionary history and mutations on branches.
+    We iterate through these mutations to find which samples (agents) carry them.
+    """
     sample_node_to_agent = {a.sample_node: a for a in hospital.agents if a.is_sampled}
     mut_data = []
     for variant in ts.variants():
@@ -357,6 +507,13 @@ def save_mutations_csv(ts, hospital, output_dir):
     df_mut.to_csv(os.path.join(output_dir, "mutations_per_patient.csv"), index=False)
 
 def save_fasta(ts, hospital, output_dir):
+    """
+    Generates FASTA sequences for all sampled agents.
+    
+    This function converts the efficient TreeSequence storage into actual string sequences.
+    ts.haplotypes() reconstructs the full genome for each sample by traversing the tree
+    and applying mutations from the root down to the tip.
+    """
     sample_node_to_agent = {a.sample_node: a for a in hospital.agents if a.is_sampled}
     with open(os.path.join(output_dir, "sampled_sequences.fasta"), "w") as f:
         for sample_index, h in enumerate(ts.haplotypes()):
@@ -402,10 +559,21 @@ def generate_plots(ts, hospital, output_dir, simulation_days):
     newick_hosp = tree_obj_hosp.newick(node_labels=hosp_labels)
     tree_ward = Phylo.read(StringIO(newick_hosp), "newick")
             
-    ward_colours = [
-        "#1f77b4", "#ff7f0e", "#2ca02c", "#9467bd", "#8c564b", 
-        "#e377c2", "#7f7f7f", "#bcbd22", "#17becf", "#000080"
-    ]
+    # Dynamic Ward Colors
+    # Use a colormap that can handle any number of wards
+    n_wards = hospital.n_wards
+    cmap_wards = plt.get_cmap("tab20" if n_wards <= 20 else "nipy_spectral")
+    
+    # Pre-calculate hex codes for each ward
+    ward_hex_colours = []
+    for i in range(n_wards):
+        # Normalize index for colormap
+        if n_wards <= 20:
+            rgba = cmap_wards(i)
+        else:
+            rgba = cmap_wards(i / n_wards)
+        ward_hex_colours.append(mcolors.to_hex(rgba))
+        
     hcw_colour = "#d62728"
     
     for clade in tree_ward.get_terminals():
@@ -416,7 +584,7 @@ def generate_plots(ts, hospital, output_dir, simulation_days):
                 if agent.role == 'HCW':
                     clade.color = hcw_colour
                 else:
-                    clade.color = ward_colours[agent.ward_id % 10]
+                    clade.color = ward_hex_colours[agent.ward_id % n_wards]
                     
     fig, ax = plt.subplots(figsize=(10, max(5, len(hospital_tips)*0.15)))
     Phylo.draw(tree_ward, axes=ax, do_show=False, show_confidence=False, label_func=lambda x: None)
