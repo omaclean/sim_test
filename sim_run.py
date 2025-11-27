@@ -15,6 +15,10 @@ def run_simulation(args):
         'N_PATIENTS': args.n_patients,
         'N_HCW': args.n_hcw,
         'N_WARDS': args.n_wards,
+        'PROB_DETECT': args.prob_detect,
+        'PROB_SEQ': args.prob_seq,
+        'ISOLATION_CAPACITY': args.isolation_capacity,
+
         'GENOME_LENGTH': 29903,
         'MUTATION_RATE': 2.7e-6,
         'COMMUNITY_DIVERSITY_LEVEL': 0.001,
@@ -27,10 +31,7 @@ def run_simulation(args):
         'MEAN_INCUBATION': 3,
         'MEAN_RECOVERY': 10,
         'SAMPLE_LAG_MEAN': 4,
-        'PROB_DETECT': args.prob_detect,
-        'PROB_SEQ': args.prob_seq,
         'HCW_CROSS_WARD_PROB': 0.1,
-        'ISOLATION_CAPACITY': args.isolation_capacity,
         'GENETIC_LINK_THRESHOLD': 1 # SNPs
     }
     
@@ -45,6 +46,7 @@ def run_simulation(args):
     
     history = []
     known_sequences = [] # List of (agent, node_id)
+    daily_census = [] # List of dicts for daily FASTA export
     
     print(f"Starting Simulation: {params['N_PATIENTS']+params['N_HCW']} Agents, {params['SIMULATION_DAYS']} Days.")
     
@@ -100,38 +102,59 @@ def run_simulation(args):
         # 4. Clinical Progression, Sampling & Infection Control
         for a in hospital.agents:
             if a.status == 'I':
-                if not a.is_sampled:
+                # --- A. Clinical Detection Logic ---
+                if not a.is_detected:
                     if day >= a.symptom_time:
                          # Detection Check
                          if np.random.random() < params['PROB_DETECT']:
-                             sample_date = a.symptom_time + np.random.poisson(params['SAMPLE_LAG_MEAN'])
-                             if day >= sample_date:
-                                 # Sequencing Check
-                                 if np.random.random() < params['PROB_SEQ']:
-                                     sample_node, updated_node = tracker.add_sample(a.infected_by_node, day)
-                                     a.is_sampled = True
-                                     a.sample_node = sample_node
-                                     a.infected_by_node = updated_node
-                                     a.sample_time = day
-                                     
-                                     # --- REAL-TIME INFECTION CONTROL ---
-                                     # Compare with known sequences to infer links
-                                     linked = False
-                                     for known_agent, known_node in known_sequences:
-                                         dist = tracker.get_pairwise_distance(sample_node, known_node)
-                                         if dist <= params['GENETIC_LINK_THRESHOLD']:
-                                             linked = True
-                                             # Isolate the known contact if still active
-                                             if known_agent.status == 'I':
-                                                 hospital.try_isolate_patient(known_agent, day)
-                                     
-                                     if linked:
-                                         hospital.try_isolate_patient(a, day)
-                                         
-                                     known_sequences.append((a, sample_node))
-                                 else:
-                                     # Detected but not sequenced - no genetic info, no isolation based on linkage
-                                     pass
+                             a.is_detected = True
+                
+                # --- B. Clinical Sequencing & Isolation (Only if Detected) ---
+                if a.is_detected and not a.is_sampled:
+                    sample_date = a.symptom_time + np.random.poisson(params['SAMPLE_LAG_MEAN'])
+                    if day >= sample_date:
+                         # Sequencing Check
+                         if np.random.random() < params['PROB_SEQ']:
+                             # Note: We create a specific 'clinical sample' node here for the record
+                             # But for daily validation, we use the census node below.
+                             # Actually, let's keep the clinical sample separate in the tree structure
+                             # so we know exactly what the hospital "saw".
+                             sample_node, updated_node = tracker.add_sample(a.infected_by_node, day)
+                             a.is_sampled = True
+                             a.sample_node = sample_node
+                             a.infected_by_node = updated_node
+                             a.sample_time = day
+                             
+                             # --- REAL-TIME INFECTION CONTROL ---
+                             # Compare with known sequences to infer links
+                             linked = False
+                             for known_agent, known_node in known_sequences:
+                                 dist = tracker.get_pairwise_distance(sample_node, known_node)
+                                 if dist <= params['GENETIC_LINK_THRESHOLD']:
+                                     linked = True
+                                     # Isolate the known contact if still active
+                                     if known_agent.status == 'I':
+                                         hospital.try_isolate_patient(known_agent, day)
+                             
+                             if linked:
+                                 hospital.try_isolate_patient(a, day)
+                                 
+                             known_sequences.append((a, sample_node))
+                
+                # --- C. Daily Census Sequencing (Validation) ---
+                # We record the virus in EVERY infected agent, every day.
+                # This creates a dense tree but ensures we have ground truth.
+                census_node, updated_node_census = tracker.add_sample(a.infected_by_node, day)
+                a.infected_by_node = updated_node_census # Update internal state to this new backbone
+                
+                daily_census.append({
+                    'day': day,
+                    'agent_id': a.id,
+                    'role': a.role,
+                    'ward': a.ward_id,
+                    'node_id': census_node,
+                    'is_detected': a.is_detected
+                })
                 
                 if day > a.infection_time + params['MEAN_RECOVERY']:
                     a.status = 'R'
@@ -192,6 +215,10 @@ def run_simulation(args):
     sim.save_fasta(ts, hospital, args.output_dir)
     print(f"Saved sampled_sequences.fasta to {args.output_dir}")
 
+    # Generate daily FASTA files for validation
+    sim.save_daily_fastas(ts, daily_census, args.output_dir, params['SIMULATION_DAYS'])
+    print(f"Saved daily FASTA files to {args.output_dir}/daily_sequences")
+
     sim.save_node_ids(hospital, args.output_dir)
     print(f"Saved hospital_node_ids.txt to {args.output_dir}")
 
@@ -209,6 +236,7 @@ if __name__ == "__main__":
     parser.add_argument("--prob-detect", type=float, default=0.4, help="Probability of detecting a case")
     parser.add_argument("--prob-seq", type=float, default=1.0, help="Probability of sequencing a detected case")
     parser.add_argument("--isolation-capacity", type=int, default=20, help="Number of isolation rooms available")
+    # above should be a function of wards presumably rather than a fixed number, same thing within a ward should have another hierarchy
     
     args = parser.parse_args()
     run_simulation(args)
