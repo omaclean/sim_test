@@ -7,6 +7,7 @@ from typing import List, Optional, Tuple
 import os
 import matplotlib.pyplot as plt
 from Bio import Phylo
+from io import StringIO
 
 # ==========================================
 # 1. CORE SIMULATION CLASSES

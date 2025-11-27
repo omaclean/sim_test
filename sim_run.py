@@ -18,6 +18,7 @@ def run_simulation(args):
         'PROB_DETECT': args.prob_detect,
         'PROB_SEQ': args.prob_seq,
         'ISOLATION_CAPACITY': args.isolation_capacity,
+        'IMPORTATION_DAILY_PROB': args.import_rate,
 
         'GENOME_LENGTH': 29903,
         'MUTATION_RATE': 2.7e-6,
@@ -27,7 +28,6 @@ def run_simulation(args):
         'BETA_ROOM': 0.15,
         'BETA_WARD': 0.01,
         'BETA_HCW_PAT': 0.015,
-        'IMPORTATION_DAILY_PROB': 0.05,
         'MEAN_INCUBATION': 3,
         'MEAN_RECOVERY': 10,
         'SAMPLE_LAG_MEAN': 4,
@@ -236,6 +236,7 @@ if __name__ == "__main__":
     parser.add_argument("--prob-detect", type=float, default=0.4, help="Probability of detecting a case")
     parser.add_argument("--prob-seq", type=float, default=1.0, help="Probability of sequencing a detected case")
     parser.add_argument("--isolation-capacity", type=int, default=20, help="Number of isolation rooms available")
+    parser.add_argument("--import_rate", type=float, default=0.05, help="Importation rate")
     # above should be a function of wards presumably rather than a fixed number, same thing within a ward should have another hierarchy
     
     args = parser.parse_args()
