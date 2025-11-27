@@ -20,5 +20,4 @@ jobs:
         
     - name: Run tests
       run: |
-        cd sim_test
         python -m pytest tests/test_simulation.py
