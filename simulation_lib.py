@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 import os
 import matplotlib.pyplot as plt
+from Bio import Phylo
 
 # ==========================================
 # 1. CORE SIMULATION CLASSES
