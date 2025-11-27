@@ -8,6 +8,9 @@ import os
 import matplotlib.pyplot as plt
 from Bio import Phylo
 from io import StringIO
+from matplotlib import colors as mcolors
+import copy
+
 
 # ==========================================
 # 1. CORE SIMULATION CLASSES
@@ -736,12 +739,14 @@ def generate_plots(ts, hospital, output_dir, simulation_days):
     if not hospital_nodes_list:
         return # No hospital cases to plot
         
-    ts_hospital = ts.simplify(samples=hospital_nodes_list)
+    # We must use map_nodes=True to track which new node corresponds to which old node
+    ts_hospital, node_map = ts.simplify(samples=hospital_nodes_list, map_nodes=True)
     
     new_id_to_agent = {}
-    for new_id, original_node_id in enumerate(hospital_nodes_list):
-        if original_node_id in sample_node_to_agent:
-            new_id_to_agent[new_id] = sample_node_to_agent[original_node_id]
+    # node_map is an array where index = old_node_id, value = new_node_id (or -1)
+    for old_id, new_id in enumerate(node_map):
+        if new_id != -1 and old_id in sample_node_to_agent:
+            new_id_to_agent[new_id] = sample_node_to_agent[old_id]
             
     hosp_labels = {n: str(n) for n in ts_hospital.samples()}
     tree_obj_hosp = ts_hospital.first()

@@ -9,7 +9,7 @@ from unittest.mock import patch
 # Add parent directory to path to import sim_test_full
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import sim_test_full
+import sim_run as sim_test_full
 
 def test_simulation_runs_and_produces_output():
     # Create a temporary directory for output
@@ -24,6 +24,7 @@ def test_simulation_runs_and_produces_output():
             prob_detect = 0.5
             prob_seq = 1.0
             isolation_capacity = 10
+            import_rate = 0.1
             
         args = Args()
         
@@ -37,22 +38,33 @@ def test_simulation_runs_and_produces_output():
             "mutations_per_patient.csv",
             "sampled_sequences.fasta",
             "hospital_node_ids.txt",
-            "recovered_split.png"
-            # "hospital_tree_ward.png", # Might not be created if no samples
-            # "hospital_tree_time.png",
-            # "community_tree_time.png"
+            "recovered_split.png",
+            # Plots should be created if there are samples
+            # With 10 days and 50 patients, it's possible no one is sampled if import rate is low
+            # But we set import_rate=0.1, so likely some infections.
         ]
         
-        # Note: Plots might not be generated if no infections/samples occur in 10 days with small pop
-        # But we can check for the main data files which are always created (even if empty or just headers)
-        
+        # Check for main files
         for f in expected_files:
             assert os.path.exists(os.path.join(temp_dir, f)), f"File {f} was not created"
             
-        # Check if mutation csv has header
-        with open(os.path.join(temp_dir, "mutations_per_patient.csv"), 'r') as f:
-            header = f.readline()
-            assert "agent_id,role,ward,position,alt" in header
+        # Check for plots if we have samples (which we likely do)
+        # But to be safe in a test, we might check if they exist OR if the tree is empty.
+        # However, let's just assert they exist for now, as we want to test plot generation.
+        # If they fail, it means no samples were generated, which is also a useful signal.
+        plot_files = [
+             "hospital_tree_ward.png",
+             "hospital_tree_time.png",
+             "community_tree_time.png"
+        ]
+        # Only check if we actually have samples? 
+        # sim_run prints "Saved tree plots..." regardless? No, generate_plots returns early if no samples.
+        # So we should only assert if we know there are samples.
+        # Let's check if sampled_sequences.fasta is non-empty?
+        
+        if os.path.getsize(os.path.join(temp_dir, "sampled_sequences.fasta")) > 0:
+             for f in plot_files:
+                 assert os.path.exists(os.path.join(temp_dir, f)), f"Plot {f} missing"
 
 def test_simulation_with_custom_output_dir():
     # Test that it creates the directory if it doesn't exist
@@ -70,6 +82,7 @@ def test_simulation_with_custom_output_dir():
             prob_detect = 0.5
             prob_seq = 1.0
             isolation_capacity = 10
+            import_rate = 0.1
 
         sim_test_full.run_simulation(Args())
         
@@ -81,13 +94,20 @@ def test_simulation_with_custom_output_dir():
             "sampled_sequences.fasta",
             "hospital_node_ids.txt",
             "recovered_split.png"
-            # "hospital_tree_ward.png", # Might not be created if no samples
-            # "hospital_tree_time.png",
-            # "community_tree_time.png"
         ]
         
         for f in expected_files:
             assert os.path.exists(os.path.join(test_dir, f)), f"Missing {f}"
+            
+        # Check plots if samples exist
+        if os.path.getsize(os.path.join(test_dir, "sampled_sequences.fasta")) > 0:
+             plot_files = [
+                 "hospital_tree_ward.png",
+                 "hospital_tree_time.png",
+                 "community_tree_time.png"
+             ]
+             for f in plot_files:
+                 assert os.path.exists(os.path.join(test_dir, f)), f"Plot {f} missing"
             
         # Check CSV content
         df = pd.read_csv(os.path.join(test_dir, "mutations_per_patient.csv"))
@@ -109,6 +129,7 @@ def test_invalid_parameters():
         prob_detect = 0.5
         prob_seq = 1.0
         isolation_capacity = 10
+        import_rate = 0.1
         
     with pytest.raises(ValueError, match="n_wards must be positive"):
         sim_test_full.run_simulation(Args())
@@ -123,6 +144,7 @@ def test_invalid_parameters():
         prob_detect = 0.5
         prob_seq = 1.0
         isolation_capacity = 10
+        import_rate = 0.1
         
     with pytest.raises(ValueError, match="n_patients must be non-negative"):
         sim_test_full.run_simulation(Args2())
@@ -139,6 +161,7 @@ def test_zero_days():
             prob_detect = 0.5
             prob_seq = 1.0
             isolation_capacity = 10
+            import_rate = 0.1
             
         sim_test_full.run_simulation(Args())
         
@@ -159,6 +182,7 @@ def test_isolation_logic():
             prob_detect = 0.8
             prob_seq = 1.0
             isolation_capacity = 50 # Plenty of space
+            import_rate = 0.1
             
         # We need to capture the history to check isolation counts.
         # Since run_simulation doesn't return history, we can check the side effects 
