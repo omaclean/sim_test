@@ -38,8 +38,8 @@ COMMUNITY_EVOLUTION_RATE = MUTATION_RATE # Rate of evolution in community
 
 # -- Transmission --
 BETA_ROOM = 0.15     # Prob transmission in same room
-BETA_WARD = 0.02     # Prob transmission in same ward (common area)
-BETA_HCW_PAT = 0.03  # Prob transmission HCW <-> Patient
+BETA_WARD = 0.01     # Prob transmission in same ward (common area)
+BETA_HCW_PAT = 0.015  # Prob transmission HCW <-> Patient
 IMPORTATION_DAILY_PROB = 0.05 # Prob a new case enters from community daily
 
 # -- Clinical / Sampling --
@@ -49,7 +49,7 @@ SAMPLE_LAG_MEAN = 4  # Days from symptom onset to sampling
 PROB_DETECT_SEQUENCE = 0.4 # Probability an infection is eventually sequenced
 
 # -- HCW Movement --
-HCW_CROSS_WARD_PROB = 0.2 # Probability HCW visits a random ward instead of home ward
+HCW_CROSS_WARD_PROB = 0.1 # Probability HCW visits a random ward instead of home ward
 
 # ==========================================
 # 2. DATA STRUCTURES & AGENTS
@@ -231,21 +231,28 @@ class PhylogenyTracker:
         """
         A infects B.
         We create a new node for the virus in B.
-        Parent is virus in A.
+        We also update the virus in A to reflect evolution up to time_now.
         """
-        # Ensure strict time ordering: child must be younger (larger time value? No, tskit usually uses time ago. 
-        # But here we are using forward time. 
-        # Wait, in finalize_tree we do: node_time = max_time - node.birth_time.
-        # So in forward time (birth_time), child.birth_time > parent.birth_time.
-        # If we have same day, we need to add epsilon.
-        
         parent_time = self.nodes.time[source_node]
-        if time_now <= parent_time:
-            time_now = parent_time + 1e-8
-            
-        child_node = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=time_now)
-        self.edges.add_row(parent=source_node, child=child_node, left=0, right=GENOME_LENGTH)
-        return child_node
+        
+        # 1. Update Source Backbone (Evolution within A)
+        current_source_node = source_node
+        if time_now > parent_time:
+             # Create intermediate node for source at time_now
+             current_source_node = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=time_now)
+             self.edges.add_row(parent=source_node, child=current_source_node, left=0, right=GENOME_LENGTH)
+             parent_time = time_now
+        
+        # 2. Create Child (Virus in B)
+        # Child must be slightly younger than parent in forward time
+        child_time = time_now
+        if child_time <= parent_time:
+             child_time = parent_time + 1e-8
+             
+        child_node = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=child_time)
+        self.edges.add_row(parent=current_source_node, child=child_node, left=0, right=GENOME_LENGTH)
+        
+        return child_node, current_source_node
 
     def add_importation(self, time_now, variant_idx=0):
         """
@@ -274,15 +281,26 @@ class PhylogenyTracker:
         """
         Patient is sequenced.
         We create a tip node representing the sample.
-        Parent is the patient's internal infection node.
+        We also update the patient's virus lineage to the sample time.
         """
         parent_time = self.nodes.time[infected_node]
-        if sample_time <= parent_time:
-            sample_time = parent_time + 1e-8
+        
+        # Update Backbone
+        current_node = infected_node
+        if sample_time > parent_time:
+            current_node = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=sample_time)
+            self.edges.add_row(parent=infected_node, child=current_node, left=0, right=GENOME_LENGTH)
+            parent_time = sample_time
             
-        sample_node = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=sample_time)
-        self.edges.add_row(parent=infected_node, child=sample_node, left=0, right=GENOME_LENGTH)
-        return sample_node
+        # Create Sample Tip
+        tip_time = sample_time
+        if tip_time <= parent_time:
+            tip_time = parent_time + 1e-8
+            
+        sample_node = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=tip_time)
+        self.edges.add_row(parent=current_node, child=sample_node, left=0, right=GENOME_LENGTH)
+        
+        return sample_node, current_node
     
     def finalize_tree(self, max_time):
         """
@@ -410,8 +428,9 @@ def run_simulation():
             target.symptom_time = day + np.random.poisson(MEAN_INCUBATION)
             
             # Genetics: Source Node -> Target Node
-            new_node = tracker.add_transmission(source.infected_by_node, day)
+            new_node, updated_source_node = tracker.add_transmission(source.infected_by_node, day)
             target.infected_by_node = new_node
+            source.infected_by_node = updated_source_node
 
         # 3. Clinical Progression & Sampling
         for a in hospital.agents:
@@ -426,9 +445,10 @@ def run_simulation():
                              sample_date = a.symptom_time + np.random.poisson(SAMPLE_LAG_MEAN)
                              if day >= sample_date:
                                  # Take sample
-                                 sample_node = tracker.add_sample(a.infected_by_node, day)
+                                 sample_node, updated_node = tracker.add_sample(a.infected_by_node, day)
                                  a.is_sampled = True
                                  a.sample_node = sample_node
+                                 a.infected_by_node = updated_node
                                  a.sample_time = day
                 
                 # Recovery
