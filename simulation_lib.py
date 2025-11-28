@@ -240,9 +240,28 @@ class PhylogenyTracker:
        - We store forward time in the tables during the sim, and then INVERT it in `finalize_tree`.
     """
     
-    def __init__(self, genome_length, mutation_rate, community_diversity_level, num_community_lineages, community_pop_size, burn_in_days=21):
+    def __init__(self, genome_length, mutation_rate, community_diversity_level, num_community_lineages, community_pop_size, burn_in_days=21, reference_path=None, transition_prob=0.7):
         self.genome_length = genome_length
         self.mutation_rate = mutation_rate
+        self.transition_prob = transition_prob
+        
+        # --- Load Reference Sequence ---
+        if reference_path and os.path.exists(reference_path):
+            # Simple FASTA parser
+            with open(reference_path, 'r') as f:
+                lines = f.readlines()
+            seq = "".join([line.strip() for line in lines if not line.startswith(">")]).upper()
+            if len(seq) != genome_length:
+                print(f"WARNING: Reference length {len(seq)} != genome_length {genome_length}. Truncating or padding.")
+                if len(seq) > genome_length:
+                    seq = seq[:genome_length]
+                else:
+                    seq = seq + "A" * (genome_length - len(seq))
+            self.reference_sequence = seq
+            print(f"Loaded reference genome from {reference_path}")
+        else:
+            self.reference_sequence = "A" * genome_length
+            print("Using default 'A' reference genome.")
         
         # --- Initialize tskit Tables ---
         # TableCollection is the mutable structure used to build the tree sequence step-by-step.
@@ -351,17 +370,33 @@ class PhylogenyTracker:
             for pos in positions:
                 # Ensure site exists in the table
                 if pos not in self.site_map:
-                    site_id = self.sites.add_row(position=pos, ancestral_state="A")
+                    ancestral_base = self.reference_sequence[pos]
+                    site_id = self.sites.add_row(position=pos, ancestral_state=ancestral_base)
                     self.site_map[pos] = site_id
                 
                 site_id = self.site_map[pos]
+                ancestral_base = self.sites.ancestral_state[site_id]
                 
-                # Record the mutation
-                # fully random mutation- bit simplistic
-                # sample a random base- different to ancestral state
-                new_base=self.rng.choice(["A", "C", "G", "T"])
-                while new_base==self.sites.ancestral_state[site_id]:
-                    new_base=self.rng.choice(["A", "C", "G", "T"])
+                # Mutation Model with Transition/Transversion Bias
+                # Transitions: A <-> G, C <-> T
+                # Transversions: All other changes
+                
+                is_transition = self.rng.random() < self.transition_prob
+                
+                if ancestral_base == 'A':
+                    new_base = 'G' if is_transition else self.rng.choice(['C', 'T'])
+                elif ancestral_base == 'G':
+                    new_base = 'A' if is_transition else self.rng.choice(['C', 'T'])
+                elif ancestral_base == 'C':
+                    new_base = 'T' if is_transition else self.rng.choice(['A', 'G'])
+                elif ancestral_base == 'T':
+                    new_base = 'C' if is_transition else self.rng.choice(['A', 'G'])
+                else:
+                    # Fallback for N or other characters
+                    new_base = self.rng.choice(['A', 'C', 'G', 'T'])
+                    while new_base == ancestral_base:
+                         new_base = self.rng.choice(['A', 'C', 'G', 'T'])
+
                 self.mutations.add_row(site=site_id, node=child, derived_state=new_base)
                 
                 # Cache for fast lookup

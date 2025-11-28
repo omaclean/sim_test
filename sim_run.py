@@ -41,7 +41,9 @@ def run_simulation(args):
         params['MUTATION_RATE'], 
         params['COMMUNITY_DIVERSITY_LEVEL'], 
         params['NUM_COMMUNITY_LINEAGES'], 
-        params['COMMUNITY_POP_SIZE']
+        params['COMMUNITY_POP_SIZE'],
+        reference_path=args.reference_file,
+        transition_prob=args.transition_prob
     )
     
     history = []
@@ -223,8 +225,9 @@ def run_simulation(args):
     print(f"Saved sampled_sequences.fasta to {args.output_dir}")
 
     # Generate daily FASTA files for validation
-    sim.save_daily_fastas(ts, daily_census, args.output_dir, params['SIMULATION_DAYS'])
-    print(f"Saved daily FASTA files to {args.output_dir}/daily_sequences")
+    if args.daily_fastas:
+        sim.save_daily_fastas(ts, daily_census, args.output_dir, params['SIMULATION_DAYS'])
+        print(f"Saved daily FASTA files to {args.output_dir}/daily_sequences")
 
     sim.save_node_ids(hospital, args.output_dir)
     print(f"Saved hospital_node_ids.txt to {args.output_dir}")
@@ -244,6 +247,9 @@ if __name__ == "__main__":
     parser.add_argument("--prob-seq", type=float, default=1.0, help="Probability of sequencing a detected case")
     parser.add_argument("--isolation-capacity", type=int, default=20, help="Number of isolation rooms available")
     parser.add_argument("--import_rate", type=float, default=0.05, help="Importation rate")
+    parser.add_argument("--reference-file", type=str, default=None, help="Path to reference FASTA file")
+    parser.add_argument("--transition-prob", type=float, default=0.7, help="Probability of transition (vs transversion)")
+    parser.add_argument("--daily-fastas", action="store_true", help="Generate daily FASTA files")
     # above should be a function of wards presumably rather than a fixed number, same thing within a ward should have another hierarchy
     
     args = parser.parse_args()
