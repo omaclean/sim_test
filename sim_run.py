@@ -30,7 +30,7 @@ def run_simulation(args):
         'BETA_HCW_PAT': 0.015,
         'MEAN_INCUBATION': 3,
         'MEAN_RECOVERY': 10,
-        'SAMPLE_LAG_MEAN': 4,
+        'SYMPTOM_DETECT_AND_SAMPLE_MEAN': 4,
         'HCW_CROSS_WARD_PROB': 0.1,
         'GENETIC_LINK_THRESHOLD': 1 # SNPs
     }
@@ -69,6 +69,12 @@ def run_simulation(args):
                 target.infection_time = day
                 target.symptom_time = day + np.random.poisson(params['MEAN_INCUBATION'])
                 
+                # Determine if/when detection happens
+                if np.random.random() < params['PROB_DETECT']:
+                    target.scheduled_detection_time = target.symptom_time + np.random.poisson(params['SYMPTOM_DETECT_AND_SAMPLE_MEAN'])
+                else:
+                    target.scheduled_detection_time = None
+                
                 variant = np.random.randint(0, params['NUM_COMMUNITY_LINEAGES'])
                 node_id = tracker.add_importation(day, variant)
                 target.infected_by_node = node_id
@@ -95,6 +101,12 @@ def run_simulation(args):
             target.infection_time = day
             target.symptom_time = day + np.random.poisson(params['MEAN_INCUBATION'])
             
+            # Determine if/when detection happens
+            if np.random.random() < params['PROB_DETECT']:
+                target.scheduled_detection_time = target.symptom_time + np.random.poisson(params['SYMPTOM_DETECT_AND_SAMPLE_MEAN'])
+            else:
+                target.scheduled_detection_time = None
+            
             new_node, updated_source_node = tracker.add_transmission(source.infected_by_node, day)
             target.infected_by_node = new_node
             source.infected_by_node = updated_source_node
@@ -104,42 +116,37 @@ def run_simulation(args):
             if a.status == 'I':
                 # --- A. Clinical Detection Logic ---
                 if not a.is_detected:
-                    if day >= a.symptom_time:
-                         # Detection Check
-                         if np.random.random() < params['PROB_DETECT']:
-                             a.is_detected = True
-                
-                # --- B. Clinical Sequencing & Isolation (Only if Detected) ---
-                if a.is_detected and not a.is_sampled:
-                    sample_date = a.symptom_time + np.random.poisson(params['SAMPLE_LAG_MEAN'])
-                    if day >= sample_date:
-                         # Sequencing Check
-                         if np.random.random() < params['PROB_SEQ']:
-                             # Note: We create a specific 'clinical sample' node here for the record
-                             # But for daily validation, we use the census node below.
-                             # Actually, let's keep the clinical sample separate in the tree structure
-                             # so we know exactly what the hospital "saw".
-                             sample_node, updated_node = tracker.add_sample(a.infected_by_node, day)
-                             a.is_sampled = True
-                             a.sample_node = sample_node
-                             a.infected_by_node = updated_node
-                             a.sample_time = day
-                             
-                             # --- REAL-TIME INFECTION CONTROL ---
-                             # Compare with known sequences to infer links
-                             linked = False
-                             for known_agent, known_node in known_sequences:
-                                 dist = tracker.get_pairwise_distance(sample_node, known_node)
-                                 if dist <= params['GENETIC_LINK_THRESHOLD']:
-                                     linked = True
-                                     # Isolate the known contact if still active
-                                     if known_agent.status == 'I':
-                                         hospital.try_isolate_patient(known_agent, day)
-                             
-                             if linked:
-                                 hospital.try_isolate_patient(a, day)
-                                 
-                             known_sequences.append((a, sample_node))
+                    if a.scheduled_detection_time is not None and day >= a.scheduled_detection_time:
+                        a.is_detected = True
+                        
+                        # --- B. Clinical Sequencing & Isolation (Immediate on Detection) ---
+                        # Sequencing Check
+                        if np.random.random() < params['PROB_SEQ']:
+                            # Note: We create a specific 'clinical sample' node here for the record
+                            # But for daily validation, we use the census node below.
+                            # Actually, let's keep the clinical sample separate in the tree structure
+                            # so we know exactly what the hospital "saw".
+                            sample_node, updated_node = tracker.add_sample(a.infected_by_node, day)
+                            a.is_sampled = True
+                            a.sample_node = sample_node
+                            a.infected_by_node = updated_node
+                            a.sample_time = day
+                            
+                            # --- REAL-TIME INFECTION CONTROL ---
+                            # Compare with known sequences to infer links
+                            linked = False
+                            for known_agent, known_node in known_sequences:
+                                dist = tracker.get_pairwise_distance(sample_node, known_node)
+                                if dist <= params['GENETIC_LINK_THRESHOLD']:
+                                    linked = True
+                                    # Isolate the known contact if still active
+                                    if known_agent.status == 'I':
+                                        hospital.try_isolate_patient(known_agent, day)
+                            
+                            if linked:
+                                hospital.try_isolate_patient(a, day)
+                                
+                            known_sequences.append((a, sample_node))
                 
                 # --- C. Daily Census Sequencing (Validation) ---
                 # We record the virus in EVERY infected agent, every day.

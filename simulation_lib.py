@@ -27,6 +27,7 @@ class Agent:
     status: str = 'S' # S, E, I, R
     infection_time: float = -1.0
     symptom_time: float = -1.0
+    scheduled_detection_time: Optional[float] = None
     
     # Genetics
     infected_by_node: int = -1 # The tskit node ID of the virus inside this person
