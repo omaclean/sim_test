@@ -678,7 +678,7 @@ def main():
     # Core simulation parameters
     parser.add_argument("--num_lineages", type=int, default=1,
                         help="Number of distinct lineages to simulate")
-    parser.add_argument("--pop_size", type=int, default=5000,
+    parser.add_argument("--pop_size", type=int, default=500,
                         help="Population size per lineage (constant)")
     parser.add_argument("--mutation_rate", type=float, default=2.7e-7,
                         help="Mutation rate per site per day")

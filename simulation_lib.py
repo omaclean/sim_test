@@ -597,9 +597,10 @@ class PhylogenyTracker:
             next_gen = []
             
             # Check if this is a branching day
-            is_branch_day = (day % self.branching_interval == 0) and day >= 0
+            is_branch_day = (day % self.branching_interval == 0)
             
             if len(prev_gen) == 0:
+
                 continue
             
             # ALWAYS continue the backbone (first individual)
@@ -625,12 +626,15 @@ class PhylogenyTracker:
                 
                 # Number of branches affects coalescence structure
                 # Fewer branches = deeper coalescence = higher diversity
-                n_new_branches = max(2, min(self.community_pop_size // 2, 10))
+                # We need enough turnover to flush the population during burn-in
+                # 20% turnover per branching event ensures full turnover in 5 events
+                n_new_branches = max(2, int(self.community_pop_size * 0.2))
                 
                 # Mutations per branch to achieve target pairwise distance
                 # Pairwise distance ≈ 2 * mutations_per_branch (when comparing branches)
                 # Some samples share recent ancestry, so we add a bit more
-                muts_per_branch = max(1, int(self.target_mutations * 0.6))
+                muts_per_branch = max(1, int(self.target_mutations * 0.5))
+
                 
                 for j in range(n_new_branches):
                     # Branch from the current backbone node
