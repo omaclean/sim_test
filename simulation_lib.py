@@ -319,15 +319,18 @@ class PhylogenyTracker:
             lineage_start_time = -burn_in_days
             
             # Create a root for this specific lineage
-            lineage_root = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=lineage_start_time - 1e-8)
+            # Lineage root should be MORE RECENT than MRCA (higher value in forward time)
+            lineage_root = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=lineage_start_time + 1e-5)
             self.edges.add_row(parent=mrca, child=lineage_root, left=0, right=genome_length)
             self.parent_map[lineage_root] = mrca
             self._add_mutations(mrca, lineage_root, 0, genome_length)
             
             # Create initial population for this lineage
+            # Each individual should be MORE RECENT than lineage root
             current_gen = []
-            for _ in range(community_pop_size):
-                u = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=lineage_start_time)
+            for j in range(community_pop_size):
+                individual_time = lineage_start_time + 2e-5 + j * 1e-5
+                u = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=individual_time)
                 self.edges.add_row(parent=lineage_root, child=u, left=0, right=genome_length)
                 self.parent_map[u] = lineage_root
                 self._add_mutations(lineage_root, u, 0, genome_length)
@@ -416,14 +419,18 @@ class PhylogenyTracker:
             prev_gen = self.community_lineages[i]
             next_gen = []
             
-            for _ in range(self.community_pop_size):
+            for j in range(self.community_pop_size):
                 # Pick parent uniformly at random
                 parent = selection_rng.choice(prev_gen)
                 
                 parent_time = self.nodes.time[parent]
-                child_time = day
-                # tskit requires child time > parent time (strictly)
-                if child_time <= parent_time: child_time = parent_time + 1e-8
+                # Use fractional day increments for within-generation variation
+                # This ensures strict ordering: day.0 < day.000001 < day.000002 etc
+                child_time = day + (j + 1) * 1e-5
+                
+                # Double check ordering
+                if child_time <= parent_time:
+                    child_time = parent_time + 1e-5
                 
                 # Create new node for this individual in the new generation
                 child = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=child_time)
@@ -469,7 +476,7 @@ class PhylogenyTracker:
         
         # 2. Create Child (The Transmitted Virus)
         child_time = time_now
-        if child_time <= parent_time: child_time = parent_time + 1e-8
+        if child_time <= parent_time: child_time = parent_time + 1e-6
              
         child_node = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=child_time)
         self.edges.add_row(parent=current_source_node, child=child_node, left=0, right=self.genome_length)
@@ -490,7 +497,7 @@ class PhylogenyTracker:
         root = np.random.choice(current_gen)
         
         parent_time = self.nodes.time[root]
-        if time_now <= parent_time: time_now = parent_time + 1e-8
+        if time_now <= parent_time: time_now = parent_time + 1e-6
         
         child_node = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=time_now)
         self.edges.add_row(parent=root, child=child_node, left=0, right=self.genome_length)
@@ -521,7 +528,7 @@ class PhylogenyTracker:
             
         # 2. Create Sample Tip
         tip_time = sample_time
-        if tip_time <= parent_time: tip_time = parent_time + 1e-8
+        if tip_time <= parent_time: tip_time = parent_time + 1e-6
             
         sample_node = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=tip_time)
         self.edges.add_row(parent=current_node, child=sample_node, left=0, right=self.genome_length)
@@ -537,15 +544,17 @@ class PhylogenyTracker:
         CRITICAL STEP: TIME INVERSION
         - We simulated in forward time (0 -> max_time).
         - tskit expects 'time ago' (max_time -> 0).
-        - We subtract all node times from max_time.
+        - We subtract all node times from max_time + buffer.
         
         Returns:
             ts: An immutable tskit.TreeSequence object.
         """
-        times = self.nodes.time
-        self.nodes.time = max_time - times
+        # Invert times: forward time -> time ago
+        # Use max_time + 1 to ensure positive times after inversion
+        times = np.array(self.nodes.time)
+        self.nodes.time = (max_time + 1.0) - times
         
-        # Sort tables (required by tskit after modifying time/topology)
+        # Sort tables (required by tskit)
         self.tables.sort()
         
         # Build the final object

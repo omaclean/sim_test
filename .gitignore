@@ -2,3 +2,4 @@ dev
 tests/__pycache__/
 __pycache__/
 tests/__pycache__/*
+test_output
