@@ -26,8 +26,11 @@ import pandas as pd
 from Bio import Phylo
 from io import StringIO
 from matplotlib import colors as mcolors
+import tskit
+import collections
 
 from simulation_lib import PhylogenyTracker
+from evolution_rate_lib import calculate_evolutionary_rate
 
 
 def run_population_simulation(
@@ -44,7 +47,8 @@ def run_population_simulation(
     deterministic: bool = False,
     target_pairwise_distance: int = None,
     branching_interval: int = 10,
-    diversity_variance: float = 1.0
+    diversity_variance: float = 1.0,
+    turnover_rate: float = 0.2
 ):
     """
     Run a population genetics simulation with multiple lineages.
@@ -61,6 +65,7 @@ def run_population_simulation(
         transition_prob: Probability of transition vs transversion mutations
         seed: Random seed for reproducibility
         diversity_variance: Multiplier for mutation count variance in deterministic mode
+        turnover_rate: Fraction of population replaced at each branching event
     """
     
     print("=" * 80)
@@ -80,6 +85,7 @@ def run_population_simulation(
         print(f"  Target pairwise distance: {target_pairwise_distance} mutations")
         print(f"  Branching interval: {branching_interval} days")
         print(f"  Diversity variance: {diversity_variance}")
+        print(f"  Turnover rate: {turnover_rate}")
     print("=" * 80)
     
     # Create output directory
@@ -100,6 +106,7 @@ def run_population_simulation(
         "target_pairwise_distance": target_pairwise_distance,
         "branching_interval": branching_interval,
         "diversity_variance": diversity_variance,
+        "turnover_rate": turnover_rate,
         "timestamp": datetime.now().isoformat()
     }
     
@@ -108,6 +115,21 @@ def run_population_simulation(
     
     # Set random seed
     np.random.seed(seed)
+    
+    # Calculate recommended burn-in if deterministic
+    if deterministic:
+        # Calculate n_new_branches per interval
+        effective_pop_size = max(10, int(pop_size * 0.1))
+        n_new_branches = max(2, int(effective_pop_size * turnover_rate))
+        
+        # Calculate intervals needed to replace population
+        # We need to replace effective_pop_size lineages
+        intervals_needed = effective_pop_size / n_new_branches
+        recommended_burn_in = int(intervals_needed * branching_interval * 1.5) # 1.5x safety factor
+        
+        print(f"Deterministic mode: Recommended burn-in >= {recommended_burn_in} days (based on turnover rate)")
+        if burn_in_days < recommended_burn_in:
+            print(f"WARNING: Provided burn-in ({burn_in_days} days) is less than recommended.")
     
     # Initialize PhylogenyTracker
     # community_diversity_level is set to 0 since we control diversity via burn_in
@@ -124,7 +146,8 @@ def run_population_simulation(
         deterministic=deterministic,
         target_pairwise_distance=target_pairwise_distance,
         branching_interval=branching_interval,
-        diversity_variance=diversity_variance
+        diversity_variance=diversity_variance,
+        turnover_rate=turnover_rate
     )
     
     print(f"✓ Burn-in complete. Starting forward simulation...")
@@ -181,11 +204,18 @@ def run_population_simulation(
     print("\nCalculating diversity statistics...")
     stats = calculate_diversity_stats(ts, daily_census, simulation_days, num_lineages)
     
+    # Calculate evolutionary rate
+    print("\nCalculating evolutionary rate...")
+    evo_stats = calculate_evolutionary_rate(ts, daily_census, output_dir, genome_length)
+    
+    # Add to stats
+    stats.update(evo_stats)
+    
     stats_path = os.path.join(output_dir, "diversity_stats.json")
     with open(stats_path, "w") as f:
         json.dump(stats, f, indent=2)
-    print(f"✓ Diversity statistics saved to {stats_path}")
-    
+    print(f"✓ Diversity statistics and evolutionary rate saved to {stats_path}")
+
     # Generate plots
     print("\nGenerating plots...")
     plot_diversity_over_time(stats, output_dir, simulation_days)
@@ -193,7 +223,7 @@ def run_population_simulation(
     
     # Generate phylogenetic tree plot
     print("\nGenerating phylogenetic tree visualization...")
-    plot_sampled_tree(ts, daily_census, output_dir, simulation_days, num_lineages)
+    plot_sampled_tree(ts, daily_census, output_dir, simulation_days, num_lineages, mutation_rate, genome_length)
     print(f"✓ Phylogenetic tree plot saved to {output_dir}")
     
     # Print summary
@@ -205,6 +235,7 @@ def run_population_simulation(
     print(f"  - tree_sequence.trees: Full phylogenetic tree (tskit format)")
     print(f"  - daily_sequences/: FASTA files for each day (day_0.fasta to day_{simulation_days-1}.fasta)")
     print(f"  - diversity_stats.json: Diversity metrics over time")
+    print(f"  - root_to_tip_regression.png: Evolutionary rate estimation")
     print(f"  - pairwise_distance_over_time.png: Mean/median pairwise distances by day")
     print(f"  - pairwise_distance_by_week.png: Mean/median pairwise distances by week")
     print(f"  - diversity_breakdown.png: Within vs between lineage diversity")
@@ -587,7 +618,7 @@ def count_segregating_sites(sequences):
     return seg_sites
 
 
-def plot_sampled_tree(ts, daily_census, output_dir, simulation_days, num_lineages, max_tips=200):
+def plot_sampled_tree(ts, daily_census, output_dir, simulation_days, num_lineages, mutation_rate=None, genome_length=None, max_tips=200):
     """
     Generate a phylogenetic tree visualization with a random subsample of tips.
     
@@ -601,6 +632,8 @@ def plot_sampled_tree(ts, daily_census, output_dir, simulation_days, num_lineage
         output_dir: Output directory
         simulation_days: Total simulation days
         num_lineages: Number of lineages
+        mutation_rate: Mutation rate (optional, for scaling branch lengths)
+        genome_length: Genome length (optional, for scaling branch lengths)
         max_tips: Maximum number of tips to display (default 200)
     """
     import collections
@@ -634,10 +667,16 @@ def plot_sampled_tree(ts, daily_census, output_dir, simulation_days, num_lineage
     
     # Get newick string
     tree_obj = ts_simplified.first()
-    node_labels = {n: str(n) for n in ts_simplified.samples()}
+    # Label ALL nodes to ensure we can map them back
+    node_labels = {n: str(n) for n in range(ts_simplified.num_nodes)}
     newick_str = tree_obj.newick(node_labels=node_labels)
     tree_viz = Phylo.read(StringIO(newick_str), "newick")
     
+    # Count mutations per node for branch scaling
+    node_mut_counts = collections.defaultdict(int)
+    for mut in ts_simplified.mutations():
+        node_mut_counts[mut.node] += 1
+
     # --- PLOT 1: Colored by Lineage ---
     cmap_lineages = plt.get_cmap("tab10" if num_lineages <= 10 else "tab20")
     lineage_colors = []
@@ -648,12 +687,24 @@ def plot_sampled_tree(ts, daily_census, output_dir, simulation_days, num_lineage
             rgba = cmap_lineages(i / num_lineages)
         lineage_colors.append(mcolors.to_hex(rgba))
     
-    for clade in tree_viz.get_terminals():
+    # Apply colors and branch lengths (mutations)
+    # Note: We apply mutation counts as branch lengths for BOTH plots for consistency?
+    # Or just for the time plot? The user asked for divergence on axis for the time plot.
+    # But usually phylogenetic trees show genetic distance.
+    
+    for clade in tree_viz.find_clades():
         if clade.name:
-            node_id = int(clade.name)
-            if node_id in new_node_to_info:
-                lineage_idx = new_node_to_info[node_id]['lineage']
-                clade.color = lineage_colors[lineage_idx % len(lineage_colors)]
+            try:
+                node_id = int(clade.name)
+                # Set branch length to mutation count
+                clade.branch_length = node_mut_counts[node_id]
+                
+                # Set color if it's a sample
+                if node_id in new_node_to_info:
+                    lineage_idx = new_node_to_info[node_id]['lineage']
+                    clade.color = lineage_colors[lineage_idx % len(lineage_colors)]
+            except ValueError:
+                pass
     
     fig, ax = plt.subplots(figsize=(12, max(8, len(sampled_nodes)*0.03)))
     Phylo.draw(tree_viz, axes=ax, do_show=False, show_confidence=False, label_func=lambda x: None)
@@ -675,22 +726,38 @@ def plot_sampled_tree(ts, daily_census, output_dir, simulation_days, num_lineage
     # Re-read the tree for coloring by time
     tree_viz_time = Phylo.read(StringIO(newick_str), "newick")
     
+    x_label = "Divergence from Root (mutations)"
+    
     cmap_time = plt.get_cmap("viridis")
     norm = plt.Normalize(0, simulation_days)
     
-    for clade in tree_viz_time.get_terminals():
+    for clade in tree_viz_time.find_clades():
         if clade.name:
-            node_id = int(clade.name)
-            if node_id in new_node_to_info:
-                day = new_node_to_info[node_id]['day']
-                rgba = cmap_time(norm(day))
-                clade.color = mcolors.to_hex(rgba)
+            try:
+                node_id = int(clade.name)
+                # Set branch length to mutation count
+                clade.branch_length = node_mut_counts[node_id]
+                
+                # Set color if it's a sample
+                if node_id in new_node_to_info:
+                    day = new_node_to_info[node_id]['day']
+                    rgba = cmap_time(norm(day))
+                    clade.color = mcolors.to_hex(rgba)
+            except ValueError:
+                pass
     
     fig, ax = plt.subplots(figsize=(12, max(8, len(sampled_nodes)*0.03)))
     Phylo.draw(tree_viz_time, axes=ax, do_show=False, show_confidence=False, label_func=lambda x: None)
     plt.title(f"Phylogenetic Tree ({len(sampled_nodes)} sampled tips) - Colored by Time", 
               fontsize=14, fontweight='bold')
-    plt.axis("off")
+    
+    # Show x-axis for divergence
+    plt.axis("on")
+    ax.get_yaxis().set_visible(False)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_visible(False)
+    plt.xlabel(x_label, fontsize=12)
     
     # Add colorbar
     sm = plt.cm.ScalarMappable(cmap=cmap_time, norm=norm)
@@ -745,6 +812,8 @@ def main():
                         help="Days between branching events (for deterministic mode)")
     parser.add_argument("--diversity_variance", type=float, default=1.0,
                         help="Multiplier for mutation count variance in deterministic mode")
+    parser.add_argument("--turnover_rate", type=float, default=0.2,
+                        help="Fraction of population replaced at each branching event (deterministic mode)")
     
     args = parser.parse_args()
     

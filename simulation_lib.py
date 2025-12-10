@@ -10,6 +10,7 @@ from Bio import Phylo
 from io import StringIO
 from matplotlib import colors as mcolors
 import copy
+import collections
 
 
 # ==========================================
@@ -240,13 +241,14 @@ class PhylogenyTracker:
        - We store forward time in the tables during the sim, and then INVERT it in `finalize_tree`.
     """
     
-    def __init__(self, genome_length, mutation_rate, community_diversity_level, num_community_lineages, community_pop_size, burn_in_days=21, reference_path=None, transition_prob=0.7, deterministic=False, target_pairwise_distance=None, branching_interval=10, diversity_variance=1.0):
+    def __init__(self, genome_length, mutation_rate, community_diversity_level, num_community_lineages, community_pop_size, burn_in_days=21, reference_path=None, transition_prob=0.7, deterministic=False, target_pairwise_distance=None, branching_interval=10, diversity_variance=1.0, turnover_rate=0.2):
         self.genome_length = genome_length
         self.mutation_rate = mutation_rate
         self.transition_prob = transition_prob
         self.deterministic = deterministic
         self.branching_interval = branching_interval  # Days between branch events
         self.diversity_variance = diversity_variance
+        self.turnover_rate = turnover_rate
         
         # Calculate target mutations for constant diversity
         if target_pairwise_distance is not None:
@@ -258,6 +260,8 @@ class PhylogenyTracker:
         # Track mutation positions for deterministic mode
         self.active_mutation_positions = set()  # Current segregating sites
         self.mutation_counter = 0  # For cycling through genome positions
+        self.mutation_window_start = 0.0 # Sliding window start position
+        self.backbone_mut_accumulator = 0.0 # Accumulator for backbone mutations
         self.lineage_branches = []  # Track side branches for ladder structure
         
         # --- Load Reference Sequence ---
@@ -499,16 +503,11 @@ class PhylogenyTracker:
             self.mutations.add_row(site=site_id, node=child, derived_state=new_base, parent=-1)
             self.node_mutations[child].append(site_id)
     
-    def _add_deterministic_mutations_simple(self, parent, child, n_muts):
+    def _add_mutations_at_positions(self, parent, child, positions):
         """
-        Adds exactly n_muts mutations deterministically by cycling through genome positions.
-        Simpler version for controlled mutation addition.
+        Adds mutations at specific positions.
         """
-        for _ in range(n_muts):
-            # Cycle through genome positions
-            pos = self.mutation_counter % self.genome_length
-            self.mutation_counter += 1
-            
+        for pos in positions:
             # Ensure site exists
             if pos not in self.site_map:
                 ancestral_base = self.reference_sequence[pos]
@@ -616,7 +615,25 @@ class PhylogenyTracker:
                              left=0, right=self.genome_length)
             self.parent_map[backbone] = backbone_parent
             
-            # Backbone doesn't accumulate mutations (stays at root level)
+            # Add mutations to backbone to drive evolutionary rate
+            # Calculate expected mutations for this step
+            dt = child_time - parent_time
+            expected_backbone_muts = self.mutation_rate * self.genome_length * dt
+            
+            self.backbone_mut_accumulator += expected_backbone_muts
+            n_backbone_muts = int(self.backbone_mut_accumulator)
+            self.backbone_mut_accumulator -= n_backbone_muts
+            
+            if n_backbone_muts > 0:
+                # Add mutations at sequential positions using mutation_counter
+                positions = []
+                for _ in range(n_backbone_muts):
+                    pos = self.mutation_counter % self.genome_length
+                    self.mutation_counter += 1
+                    positions.append(pos)
+                self._add_mutations_at_positions(backbone_parent, backbone, positions)
+            
+            # Backbone accumulates mutations
             # All diversity comes from branches
             next_gen_unique = [backbone]
             
@@ -632,8 +649,8 @@ class PhylogenyTracker:
                 # Number of branches affects coalescence structure
                 # Fewer branches = deeper coalescence = higher diversity
                 # We need enough turnover to flush the population during burn-in
-                # 20% turnover per branching event ensures full turnover in 5 events
-                n_new_branches = max(2, int(effective_pop_size * 0.2))
+                # turnover_rate per branching event
+                n_new_branches = max(2, int(effective_pop_size * self.turnover_rate))
                 
                 # Mutations per branch to achieve target pairwise distance
                 # Pairwise distance ≈ 2 * mutations_per_branch (when comparing branches)
@@ -678,7 +695,20 @@ class PhylogenyTracker:
                     n_branch_muts = int(round(target_muts_per_branch + offset))
                     n_branch_muts = max(0, n_branch_muts) # Allow 0 mutations (identical to backbone)
                     
-                    self._add_deterministic_mutations_simple(backbone, branch, n_branch_muts)
+                    # Generate positions for branch diversity
+                    # We use a hash of day/branch to pick positions pseudo-randomly
+                    # This ensures they are distinct from backbone mutations (which use mutation_counter)
+                    # but consistent if we re-ran (though we use rng for stochastic mode)
+                    positions = []
+                    for k in range(n_branch_muts):
+                        # Use a large prime step to scatter positions
+                        # Offset by day/branch to vary
+                        seed_val = day * 1000 + j * 100 + k
+                        pos = (seed_val * 7919) % self.genome_length
+                        positions.append(pos)
+                    
+                    self._add_mutations_at_positions(backbone, branch, positions)
+                    
                     next_gen_unique.append(branch)
                 
                 # Keep some existing branches to maintain diversity gradient
@@ -698,17 +728,10 @@ class PhylogenyTracker:
                     branches_to_keep = prev_gen_unique[:min(n_keep, len(prev_gen_unique))]
                     
                     for parent in branches_to_keep:
-                        parent_time = self.nodes.time[parent]
-                        child_time = max(day + (len(next_gen_unique) + 1) * 1e-5, parent_time + 1e-5)
-                        
-                        child = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=child_time)
-                        self.edges.add_row(parent=parent, child=child,
-                                         left=0, right=self.genome_length)
-                        self.parent_map[child] = parent
-                        
-                        # Existing branches: no new mutations (just persist)
-                        # Mutations only added at branching events
-                        next_gen_unique.append(child)
+                        # Just keep the existing branch node
+                        # This ensures its time remains fixed, so it "ages" relative to current day
+                        # and will eventually be removed by the turnover logic (sorted by time)
+                        next_gen_unique.append(parent)
             else:
                 # NON-BRANCHING DAY: Continue existing unique branches
                 prev_gen_unique = sorted(list(set(prev_gen)), key=lambda x: self.nodes.time[x], reverse=True)
@@ -719,17 +742,9 @@ class PhylogenyTracker:
                 limit = effective_pop_size - 1
                 branches_to_keep = prev_gen_unique[:min(limit, len(prev_gen_unique))]
 
-                for j, parent in enumerate(branches_to_keep, 1):
-                    parent_time = self.nodes.time[parent]
-                    child_time = max(day + (j + 1) * 1e-5, parent_time + 1e-5)
-                    
-                    child = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=child_time)
-                    self.edges.add_row(parent=parent, child=child,
-                                     left=0, right=self.genome_length)
-                    self.parent_map[child] = parent
-                    
-                    # No mutations between branching events (only at branch points)
-                    next_gen_unique.append(child)
+                for parent in branches_to_keep:
+                    # Just keep the existing branch node
+                    next_gen_unique.append(parent)
             
             # Expand unique lineages to full population size (Clonal Expansion)
             # Deterministically replicate lineages to fill community_pop_size
