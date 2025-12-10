@@ -696,12 +696,9 @@ def draw_tree_custom(ax, tree, title, color_attr='color', show_colorbar=False, c
     # Draw internal nodes (polytomies)
     for clade in tree.get_nonterminals():
         x, y = x_coords[clade], y_coords[clade]
-        # Draw all internal nodes to be safe, or just polytomies
+        # Draw points only on polytomies (nodes with > 2 children)
         if len(clade.clades) > 2:
-            ax.scatter(x, y, color='black', s=20, zorder=10, marker='o')
-        else:
-            # Regular nodes
-            ax.scatter(x, y, color='gray', s=10, zorder=5, marker='o')
+            ax.scatter(x, y, color='black', s=25, zorder=10, marker='o')
 
     ax.set_title(title, fontsize=14, fontweight='bold')
     ax.set_xlabel("Divergence from Root (mutations)")
