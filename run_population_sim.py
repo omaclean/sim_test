@@ -618,7 +618,7 @@ def count_segregating_sites(sequences):
     return seg_sites
 
 
-def plot_sampled_tree(ts, daily_census, output_dir, simulation_days, num_lineages, mutation_rate=None, genome_length=None, max_tips=200):
+def plot_sampled_tree(ts, daily_census, output_dir, simulation_days, num_lineages, mutation_rate=None, genome_length=None, max_tips=500):
     """
     Generate a phylogenetic tree visualization with a random subsample of tips.
     
@@ -634,7 +634,7 @@ def plot_sampled_tree(ts, daily_census, output_dir, simulation_days, num_lineage
         num_lineages: Number of lineages
         mutation_rate: Mutation rate (optional, for scaling branch lengths)
         genome_length: Genome length (optional, for scaling branch lengths)
-        max_tips: Maximum number of tips to display (default 200)
+        max_tips: Maximum number of tips to display (default 1000)
     """
     import collections
     
@@ -751,13 +751,8 @@ def plot_sampled_tree(ts, daily_census, output_dir, simulation_days, num_lineage
     plt.title(f"Phylogenetic Tree ({len(sampled_nodes)} sampled tips) - Colored by Time", 
               fontsize=14, fontweight='bold')
     
-    # Show x-axis for divergence
-    plt.axis("on")
-    ax.get_yaxis().set_visible(False)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.spines['left'].set_visible(False)
-    plt.xlabel(x_label, fontsize=12)
+    # Hide axis
+    plt.axis("off")
     
     # Add colorbar
     sm = plt.cm.ScalarMappable(cmap=cmap_time, norm=norm)
@@ -780,7 +775,7 @@ def main():
                         help="Number of distinct lineages to simulate")
     parser.add_argument("--pop_size", type=int, default=500,
                         help="Population size per lineage (constant)")
-    parser.add_argument("--mutation_rate", type=float, default=2.7e-7,
+    parser.add_argument("--mutation_rate", type=float, default=2.7e-6,
                         help="Mutation rate per site per day")
     
     # Time parameters
