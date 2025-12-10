@@ -4,6 +4,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 import tskit
+import collections
 
 def calculate_evolutionary_rate(ts, daily_census, output_dir, genome_length):
     """

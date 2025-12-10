@@ -618,6 +618,108 @@ def count_segregating_sites(sequences):
     return seg_sites
 
 
+def get_x_coordinates(tree):
+    """Calculate x-coordinates (distance from root) for all nodes."""
+    x_coords = {tree.root: 0}
+    stack = [tree.root]
+    while stack:
+        parent = stack.pop()
+        for child in parent.clades:
+            x_coords[child] = x_coords[parent] + (child.branch_length or 0)
+            stack.append(child)
+    return x_coords
+
+
+def get_y_coordinates(tree, dist=1.0):
+    """
+    Calculate y-coordinates for all nodes in the tree.
+    Tips are assigned y-coordinates 0, 1, ...
+    Internal nodes are the mean of their children.
+    """
+    y_coords = {}
+    max_y = 0
+    
+    for clade in tree.get_terminals():
+        y_coords[clade] = max_y
+        max_y += dist
+        
+    # Post-order traversal to set internal node y
+    for clade in tree.get_nonterminals(order='postorder'):
+        children_y = [y_coords[c] for c in clade.clades]
+        if children_y:
+            y_coords[clade] = sum(children_y) / len(children_y)
+        else:
+            y_coords[clade] = 0
+            
+    return y_coords
+
+
+def get_mpl_color(color):
+    """Convert Bio.Phylo color to matplotlib compatible color."""
+    if color is None:
+        return 'k'
+    if hasattr(color, 'to_hex'):
+        return color.to_hex()
+    if hasattr(color, 'red') and hasattr(color, 'green') and hasattr(color, 'blue'):
+        # Bio.Phylo BranchColor uses 0-255
+        return (color.red/255, color.green/255, color.blue/255)
+    return color
+
+
+def draw_tree_custom(ax, tree, title, color_attr='color', show_colorbar=False, cmap=None, norm=None):
+    """Custom tree drawing function with circles at tips and visible polytomies."""
+    x_coords = get_x_coordinates(tree)
+    y_coords = get_y_coordinates(tree)
+    
+    # Draw branches
+    for clade in tree.find_clades(order='level'):
+        if clade.clades:
+            # Draw vertical line connecting children
+            x = x_coords[clade]
+            ys = [y_coords[c] for c in clade.clades]
+            ymin, ymax = min(ys), max(ys)
+            ax.plot([x, x], [ymin, ymax], color='gray', lw=1)
+            
+            # Draw horizontal lines to children
+            for child in clade.clades:
+                xc = x_coords[child]
+                yc = y_coords[child]
+                color = get_mpl_color(getattr(child, color_attr, 'k'))
+                ax.plot([x, xc], [yc, yc], color=color, lw=1.5)
+    
+    # Draw tips (circles)
+    for clade in tree.get_terminals():
+        x, y = x_coords[clade], y_coords[clade]
+        color = get_mpl_color(getattr(clade, color_attr, 'k'))
+        ax.scatter(x, y, color=color, s=30, zorder=10, edgecolors='none')
+        
+    # Draw internal nodes (polytomies)
+    for clade in tree.get_nonterminals():
+        x, y = x_coords[clade], y_coords[clade]
+        # Draw all internal nodes to be safe, or just polytomies
+        if len(clade.clades) > 2:
+            ax.scatter(x, y, color='black', s=20, zorder=10, marker='o')
+        else:
+            # Regular nodes
+            ax.scatter(x, y, color='gray', s=10, zorder=5, marker='o')
+
+    ax.set_title(title, fontsize=14, fontweight='bold')
+    ax.set_xlabel("Divergence from Root (mutations)")
+    
+    # Remove y axis
+    ax.get_yaxis().set_visible(False)
+    
+    # Remove spines
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_visible(False)
+    
+    if show_colorbar and cmap and norm:
+        sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+        sm.set_array([])
+        plt.colorbar(sm, ax=ax, label="Day", fraction=0.046, pad=0.04)
+
+
 def plot_sampled_tree(ts, daily_census, output_dir, simulation_days, num_lineages, mutation_rate=None, genome_length=None, max_tips=500):
     """
     Generate a phylogenetic tree visualization with a random subsample of tips.
@@ -638,23 +740,27 @@ def plot_sampled_tree(ts, daily_census, output_dir, simulation_days, num_lineage
     """
     import collections
     
-    # Get all sample nodes
-    all_samples = list(ts.samples())
-    
-    # Randomly subsample if needed
-    if len(all_samples) > max_tips:
-        sampled_nodes = list(np.random.choice(all_samples, max_tips, replace=False))
-    else:
-        sampled_nodes = all_samples
-    
-    if len(sampled_nodes) == 0:
-        print("  Warning: No samples to plot")
-        return
-    
     # Create mapping from node_id to census info
     node_to_info = {}
     for record in daily_census:
         node_to_info[record['node_id']] = record
+
+    # Filter samples: Only plot tips from day 1 onwards
+    valid_samples = []
+    for node_id in ts.samples():
+        if node_id in node_to_info:
+            if node_to_info[node_id]['day'] >= 1:
+                valid_samples.append(node_id)
+    
+    if not valid_samples:
+        print("  Warning: No samples from day >= 1 to plot")
+        return
+
+    # Randomly subsample if needed
+    if len(valid_samples) > max_tips:
+        sampled_nodes = list(np.random.choice(valid_samples, max_tips, replace=False))
+    else:
+        sampled_nodes = valid_samples
     
     # Simplify tree to sampled nodes
     ts_simplified, node_map = ts.simplify(samples=sampled_nodes, map_nodes=True)
@@ -672,6 +778,9 @@ def plot_sampled_tree(ts, daily_census, output_dir, simulation_days, num_lineage
     newick_str = tree_obj.newick(node_labels=node_labels)
     tree_viz = Phylo.read(StringIO(newick_str), "newick")
     
+    # Ladderize the tree
+    tree_viz.ladderize()
+    
     # Count mutations per node for branch scaling
     node_mut_counts = collections.defaultdict(int)
     for mut in ts_simplified.mutations():
@@ -688,10 +797,6 @@ def plot_sampled_tree(ts, daily_census, output_dir, simulation_days, num_lineage
         lineage_colors.append(mcolors.to_hex(rgba))
     
     # Apply colors and branch lengths (mutations)
-    # Note: We apply mutation counts as branch lengths for BOTH plots for consistency?
-    # Or just for the time plot? The user asked for divergence on axis for the time plot.
-    # But usually phylogenetic trees show genetic distance.
-    
     for clade in tree_viz.find_clades():
         if clade.name:
             try:
@@ -707,10 +812,7 @@ def plot_sampled_tree(ts, daily_census, output_dir, simulation_days, num_lineage
                 pass
     
     fig, ax = plt.subplots(figsize=(12, max(8, len(sampled_nodes)*0.03)))
-    Phylo.draw(tree_viz, axes=ax, do_show=False, show_confidence=False, label_func=lambda x: None)
-    plt.title(f"Phylogenetic Tree ({len(sampled_nodes)} sampled tips) - Colored by Lineage", 
-              fontsize=14, fontweight='bold')
-    plt.axis("off")
+    draw_tree_custom(ax, tree_viz, f"Phylogenetic Tree ({len(sampled_nodes)} sampled tips) - Colored by Lineage")
     
     # Add legend for lineages
     from matplotlib.patches import Patch
@@ -725,11 +827,10 @@ def plot_sampled_tree(ts, daily_census, output_dir, simulation_days, num_lineage
     # --- PLOT 2: Colored by Time ---
     # Re-read the tree for coloring by time
     tree_viz_time = Phylo.read(StringIO(newick_str), "newick")
-    
-    x_label = "Divergence from Root (mutations)"
+    tree_viz_time.ladderize()
     
     cmap_time = plt.get_cmap("viridis")
-    norm = plt.Normalize(0, simulation_days)
+    norm = mcolors.Normalize(0, simulation_days)
     
     for clade in tree_viz_time.find_clades():
         if clade.name:
@@ -747,17 +848,8 @@ def plot_sampled_tree(ts, daily_census, output_dir, simulation_days, num_lineage
                 pass
     
     fig, ax = plt.subplots(figsize=(12, max(8, len(sampled_nodes)*0.03)))
-    Phylo.draw(tree_viz_time, axes=ax, do_show=False, show_confidence=False, label_func=lambda x: None)
-    plt.title(f"Phylogenetic Tree ({len(sampled_nodes)} sampled tips) - Colored by Time", 
-              fontsize=14, fontweight='bold')
-    
-    # Hide axis
-    plt.axis("off")
-    
-    # Add colorbar
-    sm = plt.cm.ScalarMappable(cmap=cmap_time, norm=norm)
-    sm.set_array([])
-    plt.colorbar(sm, ax=ax, label="Day", fraction=0.046, pad=0.04)
+    draw_tree_custom(ax, tree_viz_time, f"Phylogenetic Tree ({len(sampled_nodes)} sampled tips) - Colored by Time",
+                     show_colorbar=True, cmap=cmap_time, norm=norm)
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, "sampled_tree_by_time.png"), dpi=300, bbox_inches='tight')
