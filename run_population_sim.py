@@ -283,7 +283,10 @@ def calculate_diversity_stats(ts, daily_census, simulation_days, num_lineages):
         "num_segregating_sites": [],
         "mean_pairwise_distance": [],
         "median_pairwise_distance": [],
-        "all_pairwise_distances": []  # Store all distances for final analysis
+        "all_pairwise_distances": [],  # Store all distances for final analysis
+        "prop_identical": [],
+        "prop_gt_4": [],
+        "num_pairs_sampled": []
     }
     
     # Sample daily if <30 days, otherwise weekly
@@ -314,6 +317,16 @@ def calculate_diversity_stats(ts, daily_census, simulation_days, num_lineages):
         
         # Calculate total diversity (returns mean, median, all_distances)
         total_div_mean, total_div_median, all_distances = calculate_pairwise_distances(all_nodes, node_to_seq)
+        
+        # Calculate proportions
+        if all_distances:
+            prop_identical = sum(d == 0 for d in all_distances) / len(all_distances)
+            prop_gt_4 = sum(d > 4 for d in all_distances) / len(all_distances)
+            num_pairs = len(all_distances)
+        else:
+            prop_identical = 0.0
+            prop_gt_4 = 0.0
+            num_pairs = 0
         
         # Calculate within-lineage diversity
         within_div_list = []
@@ -358,6 +371,9 @@ def calculate_diversity_stats(ts, daily_census, simulation_days, num_lineages):
         stats["mean_pairwise_distance"].append(total_div_mean)
         stats["median_pairwise_distance"].append(total_div_median)
         stats["all_pairwise_distances"].append(all_distances)
+        stats["prop_identical"].append(prop_identical)
+        stats["prop_gt_4"].append(prop_gt_4)
+        stats["num_pairs_sampled"].append(num_pairs)
     
     return stats
 
@@ -427,36 +443,48 @@ def plot_diversity_over_time(stats, output_dir, simulation_days):
         'median_distance': stats['median_pairwise_distance'],
         'within_lineage': stats['within_lineage_diversity'],
         'between_lineage': stats['between_lineage_diversity'],
-        'segregating_sites': stats['num_segregating_sites']
+        'segregating_sites': stats['num_segregating_sites'],
+        'prop_identical': stats['prop_identical'],
+        'prop_gt_4': stats['prop_gt_4'],
+        'num_pairs': stats['num_pairs_sampled']
     })
     
     # --- PLOT 1: Pairwise Distance Over Time ---
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, ax1 = plt.subplots(figsize=(12, 6))
     
     # Direct plot (already sampled appropriately during calculation)
-    ax.plot(df['day'], df['mean_distance'], 'o-', 
+    ax1.plot(df['day'], df['mean_distance'], 'o-', 
             label='Mean Pairwise Distance', 
             color='steelblue', linewidth=2.5, markersize=8, alpha=0.8)
-    ax.plot(df['day'], df['median_distance'], 's-', 
+    ax1.plot(df['day'], df['median_distance'], 's-', 
             label='Median Pairwise Distance', 
             color='coral', linewidth=2.5, markersize=8, alpha=0.8)
     
-    ax.set_xlabel('Day', fontsize=12)
-    ax.set_ylabel('Pairwise Distance (SNPs)', fontsize=12)
+    ax1.set_xlabel('Day', fontsize=12)
+    ax1.set_ylabel('Pairwise Distance (SNPs)', fontsize=12)
     
-    # Adjust title based on sampling frequency
-    if len(df) > 0:
-        day_diff = df['day'].diff().dropna()
-        if len(day_diff) > 0 and day_diff.mean() > 1.5:
-            title = 'Pairwise Genetic Distance Over Time\n(Weekly sampling)'
-        else:
-            title = 'Pairwise Genetic Distance Over Time\n(Daily sampling)'
-    else:
-        title = 'Pairwise Genetic Distance Over Time'
+    # Create secondary axis for proportions
+    ax2 = ax1.twinx()
+    ax2.plot(df['day'], df['prop_identical'], 'v--',
+             label='Proportion Identical',
+             color='green', linewidth=2, markersize=6, alpha=0.6)
+    ax2.plot(df['day'], df['prop_gt_4'], '^--',
+             label='Proportion > 4 Mutations',
+             color='purple', linewidth=2, markersize=6, alpha=0.6)
+    ax2.set_ylabel('Proportion of Pairs', fontsize=12)
+    ax2.set_ylim(0, 1.05)
     
-    ax.set_title(title, fontsize=14, fontweight='bold')
-    ax.legend(fontsize=10, loc='best')
-    ax.grid(True, alpha=0.3)
+    # Combine legends
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', fontsize=10)
+    
+    # Title with sample size info
+    avg_pairs = int(df['num_pairs'].mean()) if len(df) > 0 else 0
+    title = f'Pairwise Genetic Distance Over Time\n(Avg {avg_pairs} pairs sampled per timepoint)'
+    
+    ax1.set_title(title, fontsize=14, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
     
     plt.tight_layout()
     plt.savefig(os.path.join(output_dir, 'pairwise_distance_over_time.png'), dpi=300)
