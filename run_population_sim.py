@@ -23,6 +23,9 @@ from datetime import datetime
 import json
 import matplotlib.pyplot as plt
 import pandas as pd
+from Bio import Phylo
+from io import StringIO
+from matplotlib import colors as mcolors
 
 from simulation_lib import PhylogenyTracker
 
@@ -37,7 +40,10 @@ def run_population_simulation(
     output_dir: str,
     reference_path: str = None,
     transition_prob: float = 0.7,
-    seed: int = 42
+    seed: int = 42,
+    deterministic: bool = False,
+    target_pairwise_distance: int = None,
+    branching_interval: int = 10
 ):
     """
     Run a population genetics simulation with multiple lineages.
@@ -67,6 +73,10 @@ def run_population_simulation(
     print(f"  Genome length: {genome_length} bp")
     print(f"  Output directory: {output_dir}")
     print(f"  Random seed: {seed}")
+    print(f"  Deterministic mode: {deterministic}")
+    if deterministic and target_pairwise_distance:
+        print(f"  Target pairwise distance: {target_pairwise_distance} mutations")
+        print(f"  Branching interval: {branching_interval} days")
     print("=" * 80)
     
     # Create output directory
@@ -83,6 +93,9 @@ def run_population_simulation(
         "reference_path": reference_path,
         "transition_prob": transition_prob,
         "seed": seed,
+        "deterministic": deterministic,
+        "target_pairwise_distance": target_pairwise_distance,
+        "branching_interval": branching_interval,
         "timestamp": datetime.now().isoformat()
     }
     
@@ -103,7 +116,10 @@ def run_population_simulation(
         community_pop_size=pop_size,
         burn_in_days=burn_in_days,
         reference_path=reference_path,
-        transition_prob=transition_prob
+        transition_prob=transition_prob,
+        deterministic=deterministic,
+        target_pairwise_distance=target_pairwise_distance,
+        branching_interval=branching_interval
     )
     
     print(f"✓ Burn-in complete. Starting forward simulation...")
@@ -168,7 +184,12 @@ def run_population_simulation(
     # Generate plots
     print("\nGenerating plots...")
     plot_diversity_over_time(stats, output_dir, simulation_days)
-    print(f"✓ Plots saved to {output_dir}")
+    print(f"✓ Diversity plots saved to {output_dir}")
+    
+    # Generate phylogenetic tree plot
+    print("\nGenerating phylogenetic tree visualization...")
+    plot_sampled_tree(ts, daily_census, output_dir, simulation_days, num_lineages)
+    print(f"✓ Phylogenetic tree plot saved to {output_dir}")
     
     # Print summary
     print("\n" + "=" * 80)
@@ -183,6 +204,8 @@ def run_population_simulation(
     print(f"  - pairwise_distance_by_week.png: Mean/median pairwise distances by week")
     print(f"  - diversity_breakdown.png: Within vs between lineage diversity")
     print(f"  - segregating_sites.png: Number of segregating sites over time")
+    print(f"  - sampled_tree_by_lineage.png: Phylogenetic tree colored by lineage")
+    print(f"  - sampled_tree_by_time.png: Phylogenetic tree colored by sampling time")
     print("=" * 80)
 
 
@@ -263,8 +286,12 @@ def calculate_diversity_stats(ts, daily_census, simulation_days, num_lineages):
         "all_pairwise_distances": []  # Store all distances for final analysis
     }
     
-    # Sample every 10 days to avoid computational overload
-    sample_days = list(range(0, simulation_days, max(1, simulation_days // 20)))
+    # Sample daily if <30 days, otherwise weekly
+    if simulation_days < 30:
+        sample_days = list(range(0, simulation_days))
+    else:
+        # Sample once per week (every 7 days)
+        sample_days = list(range(0, simulation_days, 7))
     
     for day in sample_days:
         if day not in census_by_day:
@@ -350,8 +377,8 @@ def calculate_pairwise_distances(node_list, node_to_seq):
     distances = []
     n = len(node_list)
     
-    # Sample up to 1000 pairs to avoid O(n^2) explosion
-    max_pairs = min(1000, n * (n - 1) // 2)
+    # Sample up to 500 pairs to avoid O(n^2) explosion
+    max_pairs = min(500, n * (n - 1) // 2)
     
     if n * (n - 1) // 2 <= max_pairs:
         # Calculate all pairs
@@ -403,17 +430,31 @@ def plot_diversity_over_time(stats, output_dir, simulation_days):
         'segregating_sites': stats['num_segregating_sites']
     })
     
-    # --- PLOT 1: Pairwise Distance Over Time (Daily) ---
+    # --- PLOT 1: Pairwise Distance Over Time ---
     fig, ax = plt.subplots(figsize=(12, 6))
     
-    ax.plot(df['day'], df['mean_distance'], 'o-', label='Mean Pairwise Distance', 
-            color='steelblue', linewidth=2, markersize=5, alpha=0.7)
-    ax.plot(df['day'], df['median_distance'], 's-', label='Median Pairwise Distance', 
-            color='coral', linewidth=2, markersize=5, alpha=0.7)
+    # Direct plot (already sampled appropriately during calculation)
+    ax.plot(df['day'], df['mean_distance'], 'o-', 
+            label='Mean Pairwise Distance', 
+            color='steelblue', linewidth=2.5, markersize=8, alpha=0.8)
+    ax.plot(df['day'], df['median_distance'], 's-', 
+            label='Median Pairwise Distance', 
+            color='coral', linewidth=2.5, markersize=8, alpha=0.8)
     
     ax.set_xlabel('Day', fontsize=12)
     ax.set_ylabel('Pairwise Distance (SNPs)', fontsize=12)
-    ax.set_title('Pairwise Genetic Distance Over Time', fontsize=14, fontweight='bold')
+    
+    # Adjust title based on sampling frequency
+    if len(df) > 0:
+        day_diff = df['day'].diff().dropna()
+        if len(day_diff) > 0 and day_diff.mean() > 1.5:
+            title = 'Pairwise Genetic Distance Over Time\n(Weekly sampling)'
+        else:
+            title = 'Pairwise Genetic Distance Over Time\n(Daily sampling)'
+    else:
+        title = 'Pairwise Genetic Distance Over Time'
+    
+    ax.set_title(title, fontsize=14, fontweight='bold')
     ax.legend(fontsize=10, loc='best')
     ax.grid(True, alpha=0.3)
     
@@ -422,11 +463,11 @@ def plot_diversity_over_time(stats, output_dir, simulation_days):
     plt.close()
     
     # --- PLOT 2: Pairwise Distance By Week ---
-    # Group by week
+    # Add week column and aggregate by week
     df['week'] = df['day'] // 7
     weekly_stats = df.groupby('week').agg({
         'mean_distance': 'mean',
-        'median_distance': 'mean',  # Average of medians per week
+        'median_distance': 'mean',
         'day': 'max'  # Last day of week
     }).reset_index()
     
@@ -513,6 +554,121 @@ def count_segregating_sites(sequences):
     return seg_sites
 
 
+def plot_sampled_tree(ts, daily_census, output_dir, simulation_days, num_lineages, max_tips=200):
+    """
+    Generate a phylogenetic tree visualization with a random subsample of tips.
+    
+    Tips are colored by:
+    1. Lineage (multiple colors for different lineages)
+    2. Time (gradient showing sampling day)
+    
+    Args:
+        ts: TreeSequence
+        daily_census: List of dicts with lineage and time info
+        output_dir: Output directory
+        simulation_days: Total simulation days
+        num_lineages: Number of lineages
+        max_tips: Maximum number of tips to display (default 200)
+    """
+    import collections
+    
+    # Get all sample nodes
+    all_samples = list(ts.samples())
+    
+    # Randomly subsample if needed
+    if len(all_samples) > max_tips:
+        sampled_nodes = list(np.random.choice(all_samples, max_tips, replace=False))
+    else:
+        sampled_nodes = all_samples
+    
+    if len(sampled_nodes) == 0:
+        print("  Warning: No samples to plot")
+        return
+    
+    # Create mapping from node_id to census info
+    node_to_info = {}
+    for record in daily_census:
+        node_to_info[record['node_id']] = record
+    
+    # Simplify tree to sampled nodes
+    ts_simplified, node_map = ts.simplify(samples=sampled_nodes, map_nodes=True)
+    
+    # Create new mapping for simplified tree
+    new_node_to_info = {}
+    for old_id, new_id in enumerate(node_map):
+        if new_id != -1 and old_id in node_to_info:
+            new_node_to_info[new_id] = node_to_info[old_id]
+    
+    # Get newick string
+    tree_obj = ts_simplified.first()
+    node_labels = {n: str(n) for n in ts_simplified.samples()}
+    newick_str = tree_obj.newick(node_labels=node_labels)
+    tree_viz = Phylo.read(StringIO(newick_str), "newick")
+    
+    # --- PLOT 1: Colored by Lineage ---
+    cmap_lineages = plt.get_cmap("tab10" if num_lineages <= 10 else "tab20")
+    lineage_colors = []
+    for i in range(num_lineages):
+        if num_lineages <= 10:
+            rgba = cmap_lineages(i)
+        else:
+            rgba = cmap_lineages(i / num_lineages)
+        lineage_colors.append(mcolors.to_hex(rgba))
+    
+    for clade in tree_viz.get_terminals():
+        if clade.name:
+            node_id = int(clade.name)
+            if node_id in new_node_to_info:
+                lineage_idx = new_node_to_info[node_id]['lineage']
+                clade.color = lineage_colors[lineage_idx % len(lineage_colors)]
+    
+    fig, ax = plt.subplots(figsize=(12, max(8, len(sampled_nodes)*0.03)))
+    Phylo.draw(tree_viz, axes=ax, do_show=False, show_confidence=False, label_func=lambda x: None)
+    plt.title(f"Phylogenetic Tree ({len(sampled_nodes)} sampled tips) - Colored by Lineage", 
+              fontsize=14, fontweight='bold')
+    plt.axis("off")
+    
+    # Add legend for lineages
+    from matplotlib.patches import Patch
+    legend_elements = [Patch(facecolor=lineage_colors[i], label=f'Lineage {i}') 
+                       for i in range(min(num_lineages, len(lineage_colors)))]
+    ax.legend(handles=legend_elements, loc='upper left', fontsize=10)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "sampled_tree_by_lineage.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # --- PLOT 2: Colored by Time ---
+    # Re-read the tree for coloring by time
+    tree_viz_time = Phylo.read(StringIO(newick_str), "newick")
+    
+    cmap_time = plt.get_cmap("viridis")
+    norm = plt.Normalize(0, simulation_days)
+    
+    for clade in tree_viz_time.get_terminals():
+        if clade.name:
+            node_id = int(clade.name)
+            if node_id in new_node_to_info:
+                day = new_node_to_info[node_id]['day']
+                rgba = cmap_time(norm(day))
+                clade.color = mcolors.to_hex(rgba)
+    
+    fig, ax = plt.subplots(figsize=(12, max(8, len(sampled_nodes)*0.03)))
+    Phylo.draw(tree_viz_time, axes=ax, do_show=False, show_confidence=False, label_func=lambda x: None)
+    plt.title(f"Phylogenetic Tree ({len(sampled_nodes)} sampled tips) - Colored by Time", 
+              fontsize=14, fontweight='bold')
+    plt.axis("off")
+    
+    # Add colorbar
+    sm = plt.cm.ScalarMappable(cmap=cmap_time, norm=norm)
+    sm.set_array([])
+    plt.colorbar(sm, ax=ax, label="Day", fraction=0.046, pad=0.04)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, "sampled_tree_by_time.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Population genetics simulation with multiple lineages",
@@ -520,17 +676,17 @@ def main():
     )
     
     # Core simulation parameters
-    parser.add_argument("--num_lineages", type=int, default=3,
+    parser.add_argument("--num_lineages", type=int, default=1,
                         help="Number of distinct lineages to simulate")
-    parser.add_argument("--pop_size", type=int, default=100,
+    parser.add_argument("--pop_size", type=int, default=5000,
                         help="Population size per lineage (constant)")
-    parser.add_argument("--mutation_rate", type=float, default=1e-4,
+    parser.add_argument("--mutation_rate", type=float, default=2.7e-7,
                         help="Mutation rate per site per day")
     
     # Time parameters
-    parser.add_argument("--burn_in", type=int, default=30,
+    parser.add_argument("--burn_in", type=int, default=50,
                         help="Days of burn-in evolution before Day 0")
-    parser.add_argument("--sim_days", type=int, default=90,
+    parser.add_argument("--sim_days", type=int, default=300,
                         help="Number of days to simulate forward")
     
     # Genome parameters
@@ -546,6 +702,14 @@ def main():
                         help="Output directory for results")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
+    
+    # Model parameters
+    parser.add_argument("--deterministic", action="store_true",
+                        help="Use deterministic ladder-tree model (constant diversity)")
+    parser.add_argument("--target_pairwise_distance", type=int, default=None,
+                        help="Target mean pairwise distance in mutations (for deterministic mode)")
+    parser.add_argument("--branching_interval", type=int, default=10,
+                        help="Days between branching events (for deterministic mode)")
     
     args = parser.parse_args()
     
@@ -573,7 +737,10 @@ def main():
         output_dir=args.output_dir,
         reference_path=args.reference,
         transition_prob=args.transition_prob,
-        seed=args.seed
+        seed=args.seed,
+        deterministic=args.deterministic,
+        target_pairwise_distance=args.target_pairwise_distance,
+        branching_interval=args.branching_interval
     )
 
 

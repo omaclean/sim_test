@@ -240,10 +240,24 @@ class PhylogenyTracker:
        - We store forward time in the tables during the sim, and then INVERT it in `finalize_tree`.
     """
     
-    def __init__(self, genome_length, mutation_rate, community_diversity_level, num_community_lineages, community_pop_size, burn_in_days=21, reference_path=None, transition_prob=0.7):
+    def __init__(self, genome_length, mutation_rate, community_diversity_level, num_community_lineages, community_pop_size, burn_in_days=21, reference_path=None, transition_prob=0.7, deterministic=False, target_pairwise_distance=None, branching_interval=10):
         self.genome_length = genome_length
         self.mutation_rate = mutation_rate
         self.transition_prob = transition_prob
+        self.deterministic = deterministic
+        self.branching_interval = branching_interval  # Days between branch events
+        
+        # Calculate target mutations for constant diversity
+        if target_pairwise_distance is not None:
+            self.target_mutations = target_pairwise_distance
+        else:
+            # Default: use mutation_rate * burn_in_days as target
+            self.target_mutations = int(mutation_rate * genome_length * burn_in_days)
+        
+        # Track mutation positions for deterministic mode
+        self.active_mutation_positions = set()  # Current segregating sites
+        self.mutation_counter = 0  # For cycling through genome positions
+        self.lineage_branches = []  # Track side branches for ladder structure
         
         # --- Load Reference Sequence ---
         if reference_path and os.path.exists(reference_path):
@@ -364,6 +378,8 @@ class PhylogenyTracker:
             
         span = right - left
         expected_muts = self.mutation_rate * branch_len * span
+        
+        # Always use Poisson for stochastic mutations
         n_muts = self.rng.poisson(expected_muts)
         
         if n_muts > 0:
@@ -400,19 +416,142 @@ class PhylogenyTracker:
                     while new_base == ancestral_base:
                          new_base = self.rng.choice(['A', 'C', 'G', 'T'])
 
-                self.mutations.add_row(site=site_id, node=child, derived_state=new_base)
+                # Add mutation with parent=-1 (will be computed later if needed)
+                self.mutations.add_row(site=site_id, node=child, derived_state=new_base, parent=-1)
                 
                 # Cache for fast lookup
                 self.node_mutations[child].append(site_id)
+    
+    def _add_deterministic_mutations(self, parent, child, child_time, is_backbone=True):
+        """
+        Adds controlled mutations for deterministic mode.
+        
+        Strategy for constant diversity:
+        1. Maintain a fixed "mutation budget" (target number of segregating sites)
+        2. On backbone: add new mutations, cycling through genome positions
+        3. On branches: inherit subset of mutations to create diversity
+        4. Old mutations naturally drop out as lineages coalesce
+        
+        This creates:
+        - Divergence through time (mutations at different positions)
+        - Constant mean pairwise distance (fixed mutation budget)
+        - Realistic tree-like distribution of distances
+        """
+        # Calculate how many mutations to add based on target diversity
+        # We want to maintain ~target_mutations segregating sites in population
+        
+        if is_backbone:
+            # Backbone gets new mutations to maintain diversity
+            # Add 1-2 mutations per branching interval to replace lost diversity
+            n_muts = max(1, int(self.target_mutations / (10 * self.branching_interval)))
+        else:
+            # Side branches get fewer mutations (they'll die out eventually)
+            n_muts = max(1, int(self.target_mutations / (20 * self.branching_interval)))
+        
+        # Select positions deterministically, cycling through genome
+        for _ in range(n_muts):
+            # Cycle through genome positions
+            pos = self.mutation_counter % self.genome_length
+            self.mutation_counter += 1
+            
+            # Skip if position was recently used (avoid back-mutations)
+            skip_count = 0
+            while pos in self.active_mutation_positions and skip_count < 100:
+                pos = self.mutation_counter % self.genome_length
+                self.mutation_counter += 1
+                skip_count += 1
+            
+            if skip_count >= 100:
+                # We've cycled through too many - just reuse positions
+                # This maintains mutation budget by replacement
+                pos = self.mutation_counter % self.genome_length
+                self.mutation_counter += 1
+            
+            self.active_mutation_positions.add(pos)
+            
+            # Limit active positions to maintain constant diversity
+            if len(self.active_mutation_positions) > self.target_mutations * 2:
+                # Remove oldest mutations
+                positions_list = sorted(self.active_mutation_positions)
+                self.active_mutation_positions = set(positions_list[-self.target_mutations:])
+            
+            # Ensure site exists
+            if pos not in self.site_map:
+                ancestral_base = self.reference_sequence[pos]
+                site_id = self.sites.add_row(position=pos, ancestral_state=ancestral_base)
+                self.site_map[pos] = site_id
+            
+            site_id = self.site_map[pos]
+            ancestral_base = self.reference_sequence[pos]  # Use reference directly
+            
+            # Deterministic mutation: use position-based selection
+            bases = ['A', 'C', 'G', 'T']
+            if ancestral_base in bases:
+                bases_copy = bases.copy()
+                bases_copy.remove(ancestral_base)
+            else:
+                bases_copy = ['C', 'G', 'T']  # Fallback if not ACGT
+            
+            new_base = bases_copy[pos % len(bases_copy)]
+            
+            # Add mutation
+            self.mutations.add_row(site=site_id, node=child, derived_state=new_base, parent=-1)
+            self.node_mutations[child].append(site_id)
+    
+    def _add_deterministic_mutations_simple(self, parent, child, n_muts):
+        """
+        Adds exactly n_muts mutations deterministically by cycling through genome positions.
+        Simpler version for controlled mutation addition.
+        """
+        for _ in range(n_muts):
+            # Cycle through genome positions
+            pos = self.mutation_counter % self.genome_length
+            self.mutation_counter += 1
+            
+            # Ensure site exists
+            if pos not in self.site_map:
+                ancestral_base = self.reference_sequence[pos]
+                site_id = self.sites.add_row(position=pos, ancestral_state=ancestral_base)
+                self.site_map[pos] = site_id
+            
+            site_id = self.site_map[pos]
+            ancestral_base = self.reference_sequence[pos]
+            
+            # Select derived state deterministically
+            bases = ['A', 'C', 'G', 'T']
+            if ancestral_base in bases:
+                bases_copy = bases.copy()
+                bases_copy.remove(ancestral_base)
+            else:
+                bases_copy = ['C', 'G', 'T']
+            
+            new_base = bases_copy[pos % len(bases_copy)]
+            
+            # Add mutation
+            self.mutations.add_row(site=site_id, node=child, derived_state=new_base, parent=-1)
+            self.node_mutations[child].append(site_id)
 
     def step_community(self, day):
         """
-        Advances the community reservoir by one day using a Wright-Fisher model.
+        Advances the community reservoir by one day.
         
-        - Each lineage (e.g., Variant A) has a fixed population size N.
-        - Generation t+1 is formed by sampling N parents from Generation t with replacement.
-        - This maintains genetic diversity and drift in the background.
+        DETERMINISTIC MODE (Ladder Tree):
+        - Maintains a backbone lineage + regular side branches
+        - Fixed mutation budget for constant pairwise diversity
+        - Mutations added/removed in controlled fashion
+        
+        STOCHASTIC MODE (Wright-Fisher):
+        - Each lineage has fixed population size N
+        - Generation t+1 formed by sampling with replacement
+        - Natural drift and diversity dynamics
         """
+        if self.deterministic:
+            self._step_community_deterministic(day)
+        else:
+            self._step_community_stochastic(day)
+    
+    def _step_community_stochastic(self, day):
+        """Standard Wright-Fisher model for stochastic evolution."""
         selection_rng = np.random.default_rng(day + 999) 
         
         for i in range(self.num_community_lineages):
@@ -420,27 +559,127 @@ class PhylogenyTracker:
             next_gen = []
             
             for j in range(self.community_pop_size):
-                # Pick parent uniformly at random
+                # Random sampling with replacement (standard Wright-Fisher)
                 parent = selection_rng.choice(prev_gen)
                 
                 parent_time = self.nodes.time[parent]
-                # Use fractional day increments for within-generation variation
-                # This ensures strict ordering: day.0 < day.000001 < day.000002 etc
                 child_time = day + (j + 1) * 1e-5
                 
-                # Double check ordering
                 if child_time <= parent_time:
                     child_time = parent_time + 1e-5
                 
-                # Create new node for this individual in the new generation
                 child = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=child_time)
                 self.edges.add_row(parent=parent, child=child, left=0, right=self.genome_length)
                 
-                # Update caches and mutations
                 self.parent_map[child] = parent
                 self._add_mutations(parent, child, 0, self.genome_length)
                 
                 next_gen.append(child)
+            
+            self.community_lineages[i] = next_gen
+    
+    def _step_community_deterministic(self, day):
+        """
+        Deterministic ladder-tree evolution model.
+        
+        Strategy for CONSTANT DIVERSITY:
+        1. Single backbone lineage that persists through time
+        2. Side branches created at regular intervals that:
+           - Branch off from backbone at different points
+           - Accumulate their own mutations
+           - Create within-population diversity
+        3. Key insight: With fixed branching pattern, pairwise distances
+           depend on MRCA depth, which we control by branch timing
+        4. Population size stays constant by replacing old branches with new ones
+        """
+        for i in range(self.num_community_lineages):
+            prev_gen = self.community_lineages[i]
+            next_gen = []
+            
+            # Check if this is a branching day
+            is_branch_day = (day % self.branching_interval == 0) and day >= 0
+            
+            if len(prev_gen) == 0:
+                continue
+            
+            # ALWAYS continue the backbone (first individual)
+            backbone_parent = prev_gen[0]
+            parent_time = self.nodes.time[backbone_parent]
+            
+            # Ensure child time is strictly after parent
+            child_time = max(day + 1e-5, parent_time + 1e-5)
+            
+            backbone = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=child_time)
+            self.edges.add_row(parent=backbone_parent, child=backbone, 
+                             left=0, right=self.genome_length)
+            self.parent_map[backbone] = backbone_parent
+            
+            # Backbone doesn't accumulate mutations (stays at root level)
+            # All diversity comes from branches
+            next_gen.append(backbone)
+            
+            if is_branch_day:
+                # BRANCHING EVENT: Create new branches with controlled mutations
+                # Key insight: pairwise distance = 2 * depth to MRCA
+                # If we want mean distance = X, branches should have ~X/2 mutations
+                
+                # Number of branches affects coalescence structure
+                # Fewer branches = deeper coalescence = higher diversity
+                n_new_branches = max(2, min(self.community_pop_size // 2, 10))
+                
+                # Mutations per branch to achieve target pairwise distance
+                # Pairwise distance ≈ 2 * mutations_per_branch (when comparing branches)
+                # Some samples share recent ancestry, so we add a bit more
+                muts_per_branch = max(1, int(self.target_mutations * 0.6))
+                
+                for j in range(n_new_branches):
+                    # Branch from the current backbone node
+                    backbone_time = self.nodes.time[backbone]
+                    branch_time = max(day + (j + 2) * 1e-5, backbone_time + 1e-6)
+                    
+                    branch = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=branch_time)
+                    self.edges.add_row(parent=backbone, child=branch,
+                                     left=0, right=self.genome_length)
+                    self.parent_map[branch] = backbone
+                    
+                    # Each branch gets similar number of mutations
+                    # Create variation by slightly varying count
+                    n_branch_muts = muts_per_branch + (j % 3) - 1  # ±1 variation
+                    n_branch_muts = max(1, n_branch_muts)
+                    self._add_deterministic_mutations_simple(backbone, branch, n_branch_muts)
+                    next_gen.append(branch)
+                
+                # Keep some existing branches to maintain diversity gradient
+                n_keep = self.community_pop_size - 1 - n_new_branches
+                if n_keep > 0 and len(prev_gen) > 1:
+                    # Keep the most recent branches (skip oldest ones)
+                    branches_to_keep = prev_gen[1:min(1 + n_keep, len(prev_gen))]
+                    
+                    for parent in branches_to_keep:
+                        parent_time = self.nodes.time[parent]
+                        child_time = max(day + (len(next_gen) + 1) * 1e-5, parent_time + 1e-5)
+                        
+                        child = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=child_time)
+                        self.edges.add_row(parent=parent, child=child,
+                                         left=0, right=self.genome_length)
+                        self.parent_map[child] = parent
+                        
+                        # Existing branches: no new mutations (just persist)
+                        # Mutations only added at branching events
+                        next_gen.append(child)
+            else:
+                # NON-BRANCHING DAY: Continue existing branches
+                for j, parent in enumerate(prev_gen[1:], 1):
+                    parent_time = self.nodes.time[parent]
+                    child_time = max(day + (j + 1) * 1e-5, parent_time + 1e-5)
+                    
+                    child = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=child_time)
+                    self.edges.add_row(parent=parent, child=child,
+                                     left=0, right=self.genome_length)
+                    self.parent_map[child] = parent
+                    
+                    # No mutations between branching events (only at branch points)
+                    next_gen.append(child)
             
             self.community_lineages[i] = next_gen
 
@@ -556,6 +795,13 @@ class PhylogenyTracker:
         
         # Sort tables (required by tskit)
         self.tables.sort()
+        
+        # Build indexes (required for compute_mutation_parents)
+        self.tables.build_index()
+        
+        # Compute mutation parents to ensure consistency with tree topology
+        # This fixes the parent field for all mutations based on the tree structure
+        self.tables.compute_mutation_parents()
         
         # Build the final object
         ts = self.tables.tree_sequence()
