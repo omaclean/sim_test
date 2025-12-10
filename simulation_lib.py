@@ -240,12 +240,13 @@ class PhylogenyTracker:
        - We store forward time in the tables during the sim, and then INVERT it in `finalize_tree`.
     """
     
-    def __init__(self, genome_length, mutation_rate, community_diversity_level, num_community_lineages, community_pop_size, burn_in_days=21, reference_path=None, transition_prob=0.7, deterministic=False, target_pairwise_distance=None, branching_interval=10):
+    def __init__(self, genome_length, mutation_rate, community_diversity_level, num_community_lineages, community_pop_size, burn_in_days=21, reference_path=None, transition_prob=0.7, deterministic=False, target_pairwise_distance=None, branching_interval=10, diversity_variance=1.0):
         self.genome_length = genome_length
         self.mutation_rate = mutation_rate
         self.transition_prob = transition_prob
         self.deterministic = deterministic
         self.branching_interval = branching_interval  # Days between branch events
+        self.diversity_variance = diversity_variance
         
         # Calculate target mutations for constant diversity
         if target_pairwise_distance is not None:
@@ -617,7 +618,11 @@ class PhylogenyTracker:
             
             # Backbone doesn't accumulate mutations (stays at root level)
             # All diversity comes from branches
-            next_gen.append(backbone)
+            next_gen_unique = [backbone]
+            
+            # Determine effective population size (number of unique lineages)
+            # We use a fraction of total pop size to allow for clonal expansion (identical genomes)
+            effective_pop_size = max(10, int(self.community_pop_size * 0.1))
             
             if is_branch_day:
                 # BRANCHING EVENT: Create new branches with controlled mutations
@@ -628,14 +633,19 @@ class PhylogenyTracker:
                 # Fewer branches = deeper coalescence = higher diversity
                 # We need enough turnover to flush the population during burn-in
                 # 20% turnover per branching event ensures full turnover in 5 events
-                n_new_branches = max(2, int(self.community_pop_size * 0.2))
+                n_new_branches = max(2, int(effective_pop_size * 0.2))
                 
                 # Mutations per branch to achieve target pairwise distance
                 # Pairwise distance ≈ 2 * mutations_per_branch (when comparing branches)
                 # Some samples share recent ancestry, so we add a bit more
-                muts_per_branch = max(1, int(self.target_mutations * 0.5))
-
+                # Use float for precision to avoid downward bias
+                target_muts_per_branch = self.target_mutations * 0.5
                 
+                # Add a small correction factor if variance is high to counteract potential skew
+                # (Though clipping at 0 usually increases mean, user observation suggests otherwise)
+                if self.diversity_variance > 1.5:
+                    target_muts_per_branch += 0.5 * (self.diversity_variance - 1.0)
+
                 for j in range(n_new_branches):
                     # Branch from the current backbone node
                     backbone_time = self.nodes.time[backbone]
@@ -648,20 +658,48 @@ class PhylogenyTracker:
                     
                     # Each branch gets similar number of mutations
                     # Create variation by slightly varying count
-                    n_branch_muts = muts_per_branch + (j % 3) - 1  # ±1 variation
-                    n_branch_muts = max(1, n_branch_muts)
+                    # Use a wider distribution to allow for more variance
+                    # Deterministic pseudo-random mapping
+                    pseudo_rand = (day * 100 + j * 17) % 100
+                    if pseudo_rand < 10:
+                        base_offset = -2.0
+                    elif pseudo_rand < 30:
+                        base_offset = -1.0
+                    elif pseudo_rand < 70:
+                        base_offset = 0.0
+                    elif pseudo_rand < 90:
+                        base_offset = 1.0
+                    else:
+                        base_offset = 2.0
+                    
+                    # Scale offset by variance parameter
+                    offset = base_offset * self.diversity_variance
+                        
+                    n_branch_muts = int(round(target_muts_per_branch + offset))
+                    n_branch_muts = max(0, n_branch_muts) # Allow 0 mutations (identical to backbone)
+                    
                     self._add_deterministic_mutations_simple(backbone, branch, n_branch_muts)
-                    next_gen.append(branch)
+                    next_gen_unique.append(branch)
                 
                 # Keep some existing branches to maintain diversity gradient
-                n_keep = self.community_pop_size - 1 - n_new_branches
-                if n_keep > 0 and len(prev_gen) > 1:
+                # We need to track which unique lineages from prev_gen correspond to unique lineages
+                # Since prev_gen contains duplicates, we need to extract unique ones first
+                prev_gen_unique = sorted(list(set(prev_gen)), key=lambda x: self.nodes.time[x], reverse=True)
+                
+                # Remove backbone from prev_gen_unique if present (it's usually the most recent/oldest depending on time direction)
+                # In forward time, backbone is updated every step.
+                # The backbone in prev_gen is backbone_parent.
+                if backbone_parent in prev_gen_unique:
+                    prev_gen_unique.remove(backbone_parent)
+                
+                n_keep = effective_pop_size - 1 - n_new_branches
+                if n_keep > 0 and len(prev_gen_unique) > 0:
                     # Keep the most recent branches (skip oldest ones)
-                    branches_to_keep = prev_gen[1:min(1 + n_keep, len(prev_gen))]
+                    branches_to_keep = prev_gen_unique[:min(n_keep, len(prev_gen_unique))]
                     
                     for parent in branches_to_keep:
                         parent_time = self.nodes.time[parent]
-                        child_time = max(day + (len(next_gen) + 1) * 1e-5, parent_time + 1e-5)
+                        child_time = max(day + (len(next_gen_unique) + 1) * 1e-5, parent_time + 1e-5)
                         
                         child = self.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=child_time)
                         self.edges.add_row(parent=parent, child=child,
@@ -670,10 +708,18 @@ class PhylogenyTracker:
                         
                         # Existing branches: no new mutations (just persist)
                         # Mutations only added at branching events
-                        next_gen.append(child)
+                        next_gen_unique.append(child)
             else:
-                # NON-BRANCHING DAY: Continue existing branches
-                for j, parent in enumerate(prev_gen[1:], 1):
+                # NON-BRANCHING DAY: Continue existing unique branches
+                prev_gen_unique = sorted(list(set(prev_gen)), key=lambda x: self.nodes.time[x], reverse=True)
+                if backbone_parent in prev_gen_unique:
+                    prev_gen_unique.remove(backbone_parent)
+                    
+                # Limit to effective_pop_size - 1 (backbone is already in next_gen_unique)
+                limit = effective_pop_size - 1
+                branches_to_keep = prev_gen_unique[:min(limit, len(prev_gen_unique))]
+
+                for j, parent in enumerate(branches_to_keep, 1):
                     parent_time = self.nodes.time[parent]
                     child_time = max(day + (j + 1) * 1e-5, parent_time + 1e-5)
                     
@@ -683,7 +729,17 @@ class PhylogenyTracker:
                     self.parent_map[child] = parent
                     
                     # No mutations between branching events (only at branch points)
-                    next_gen.append(child)
+                    next_gen_unique.append(child)
+            
+            # Expand unique lineages to full population size (Clonal Expansion)
+            # Deterministically replicate lineages to fill community_pop_size
+            next_gen = []
+            if len(next_gen_unique) > 0:
+                for k in range(self.community_pop_size):
+                    # Cycle through unique lineages
+                    # This ensures even distribution
+                    idx = k % len(next_gen_unique)
+                    next_gen.append(next_gen_unique[idx])
             
             self.community_lineages[i] = next_gen
 

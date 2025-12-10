@@ -43,7 +43,8 @@ def run_population_simulation(
     seed: int = 42,
     deterministic: bool = False,
     target_pairwise_distance: int = None,
-    branching_interval: int = 10
+    branching_interval: int = 10,
+    diversity_variance: float = 1.0
 ):
     """
     Run a population genetics simulation with multiple lineages.
@@ -59,6 +60,7 @@ def run_population_simulation(
         reference_path: Optional path to reference genome FASTA
         transition_prob: Probability of transition vs transversion mutations
         seed: Random seed for reproducibility
+        diversity_variance: Multiplier for mutation count variance in deterministic mode
     """
     
     print("=" * 80)
@@ -77,6 +79,7 @@ def run_population_simulation(
     if deterministic and target_pairwise_distance:
         print(f"  Target pairwise distance: {target_pairwise_distance} mutations")
         print(f"  Branching interval: {branching_interval} days")
+        print(f"  Diversity variance: {diversity_variance}")
     print("=" * 80)
     
     # Create output directory
@@ -96,6 +99,7 @@ def run_population_simulation(
         "deterministic": deterministic,
         "target_pairwise_distance": target_pairwise_distance,
         "branching_interval": branching_interval,
+        "diversity_variance": diversity_variance,
         "timestamp": datetime.now().isoformat()
     }
     
@@ -119,7 +123,8 @@ def run_population_simulation(
         transition_prob=transition_prob,
         deterministic=deterministic,
         target_pairwise_distance=target_pairwise_distance,
-        branching_interval=branching_interval
+        branching_interval=branching_interval,
+        diversity_variance=diversity_variance
     )
     
     print(f"✓ Burn-in complete. Starting forward simulation...")
@@ -738,6 +743,8 @@ def main():
                         help="Target mean pairwise distance in mutations (for deterministic mode)")
     parser.add_argument("--branching_interval", type=int, default=10,
                         help="Days between branching events (for deterministic mode)")
+    parser.add_argument("--diversity_variance", type=float, default=1.0,
+                        help="Multiplier for mutation count variance in deterministic mode")
     
     args = parser.parse_args()
     
@@ -768,7 +775,8 @@ def main():
         seed=args.seed,
         deterministic=args.deterministic,
         target_pairwise_distance=args.target_pairwise_distance,
-        branching_interval=args.branching_interval
+        branching_interval=args.branching_interval,
+        diversity_variance=args.diversity_variance
     )
 
 
