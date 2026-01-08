@@ -15,8 +15,10 @@ import numpy as np
 from collections import defaultdict
 from Bio import SeqIO, Phylo, AlignIO
 from Bio.Seq import Seq
-from Bio.Phylo.TreeConstruction import DistanceCalculator, DistanceTreeConstructor, DistanceMatrix
+from Bio.Phylo.TreeConstruction import DistanceCalculator, DistanceTreeConstructor, DistanceMatrix, ParsimonyScorer, NNITreeSearcher, ParsimonyTreeConstructor
+from Bio.Align import MultipleSeqAlignment
 import scipy.spatial.distance as distance
+import scipy.cluster.hierarchy as sch
 from Bio.SeqRecord import SeqRecord
 import matplotlib.pyplot as plt
 import matplotlib.cm as cm
@@ -416,6 +418,11 @@ def plot_final_tree(records, id_to_day_map, max_day, output_dir, mutation_rate):
         print("No records to plot.")
         return
 
+    # 0. Export Subsampled FASTA
+    print("  Exporting subsampled FASTA...")
+    fasta_path = os.path.join(output_dir, "subsampled_tree_sequences.fasta")
+    SeqIO.write(records, fasta_path, "fasta")
+
     # 1. Convert sequences to numpy byte array (N, L)
     L = len(records[0].seq)
     N = len(records)
@@ -437,70 +444,114 @@ def plot_final_tree(records, id_to_day_map, max_day, output_dir, mutation_rate):
     condensed_dist = distance.pdist(seq_matrix, 'hamming')
     square_dist = distance.squareform(condensed_dist)
     
+    # 2b. Export Distance Matrix
+    print("  Exporting distance matrix...")
+    dm_path = os.path.join(output_dir, "distance_matrix.csv")
+    with open(dm_path, "w") as f:
+        f.write("," + ",".join(names) + "\n")
+        for i in range(N):
+            # Format to 6 decimal places
+            row_vals = [f"{x:.6f}" for x in square_dist[i]]
+            f.write(f"{names[i]}," + ",".join(row_vals) + "\n")
+    
     # 3. Convert to BioPython DistanceMatrix
     lower_triangular = [square_dist[i, :i+1].tolist() for i in range(N)]
     dm = DistanceMatrix(names, lower_triangular)
     
-    # 4. Build Trees (NJ and UPGMA)
-    algorithms = ['nj', 'upgma']
+    # 4. Build Trees (NJ, UPGMA, Parsimony)
+    algorithms = ['nj', 'upgma' ] #, 'parsimony']
     constructor = DistanceTreeConstructor()
+    nj_tree = None # To store for Parsimony starting tree
     
     for algo in algorithms:
         print(f"  Building {algo.upper()} tree...")
         
-        if algo == 'nj':
-            tree = constructor.nj(dm)
-        else:
-            tree = constructor.upgma(dm)
-        
-        # Root at earliest sequence
-        try:
-            # Find the earliest day
-            min_day = min(id_to_day_map.values()) if id_to_day_map else 0
-            
-            # Find a sequence from that earliest day
-            outgroup = None
-            for name, day in id_to_day_map.items():
-                if day == min_day:
-                    outgroup = name
-                    break
-            
-            if outgroup:
-                print(f"    Rooting {algo.upper()} tree with earliest sequence (Day {min_day}): {outgroup}")
-                outgroup_clade = None
-                for c in tree.get_terminals():
-                    if c.name == outgroup:
-                        outgroup_clade = c
-                        break
-                if outgroup_clade:
-                     tree.root_with_outgroup(outgroup_clade)
-                else:
-                     tree.root_with_outgroup({"name": outgroup})
-            else:
-                 print("    Warning: No sequence found for rooting. Using midpoint rooting.")
-                 tree.root_at_midpoint()
-        except Exception as e:
-            print(f"    Warning: Could not root {algo.upper()} tree. {e}")
-            try: tree.root_at_midpoint()
-            except: pass
-        
-        # Plot
-        print(f"    Drawing {algo.upper()} tree...")
+        # Setup Figure
         fig, ax = plt.subplots(figsize=(12, 10))
-        
-        # Color mapping
         norm = mcolors.Normalize(vmin=0, vmax=max_day)
-        cmap = cm.turbo  
-        
-        for clade in tree.get_terminals():
-            cid = clade.name
-            day = id_to_day_map.get(cid, 0)
-            clade.custom_color = mcolors.to_hex(cmap(norm(day)))
-            
+        cmap = cm.turbo 
         title = f"Population Structure ({algo.upper()})\nRate: {mutation_rate} muts/site/day\nTime: {max_day} Days"
-        draw_tree_custom(ax, tree, title, color_attr='custom_color')
         
-        # Add Colorbar
+        tree = None
+        
+        if algo == 'parsimony':
+            print("    Calculating Parsimony tree (this may take a while)...")
+            try:
+                # 1. Prepare Alignment (ensure rectangular)
+                aligned_records = []
+                for rec in records:
+                    seq_str = str(rec.seq)
+                    if len(seq_str) > L: seq_str = seq_str[:L]
+                    elif len(seq_str) < L: seq_str = seq_str.ljust(L, '-')
+                    # Create clean record for alignment
+                    # Note: Parsimony works with Seq/SeqRecord objects
+                    aligned_records.append(SeqRecord(Seq(seq_str), id=rec.id, name=rec.id, description=rec.id))
+                
+                alignment = MultipleSeqAlignment(aligned_records)
+                
+                # 2. Setup Parsimony Search
+                # We use the NJ tree as a starting point to be efficient
+                # Recalculate NJ tree to ensure a clean starting point and avoid deepcopy issues
+                start_tree = constructor.nj(dm)
+                
+                scorer = ParsimonyScorer()
+                searcher = NNITreeSearcher(scorer)
+                pars_constructor = ParsimonyTreeConstructor(searcher, start_tree)
+                
+                # Build tree
+                tree = pars_constructor.build_tree(alignment)
+                
+            except Exception as e:
+                print(f"    Error building Parsimony tree: {e}")
+                plt.close()
+                continue
+                
+        elif algo == 'nj':
+            tree = constructor.nj(dm)
+        elif algo == 'upgma':
+            tree = constructor.upgma(dm)
+
+        # Root at earliest sequence
+        if tree:
+            try:
+                # Find the earliest day
+                min_day = min(id_to_day_map.values()) if id_to_day_map else 0
+                
+                # Find a sequence from that earliest day
+                outgroup = None
+                for name, day in id_to_day_map.items():
+                    if day == min_day:
+                        outgroup = name
+                        break
+                
+                if outgroup:
+                    print(f"    Rooting {algo.upper()} tree with earliest sequence (Day {min_day}): {outgroup}")
+                    outgroup_clade = None
+                    for c in tree.get_terminals():
+                        if c.name == outgroup:
+                            outgroup_clade = c
+                            break
+                    if outgroup_clade:
+                         tree.root_with_outgroup(outgroup_clade)
+                    else:
+                         tree.root_with_outgroup({"name": outgroup})
+                else:
+                     print("    Warning: No sequence found for rooting. Using midpoint rooting.")
+                     tree.root_at_midpoint()
+            except Exception as e:
+                print(f"    Warning: Could not root {algo.upper()} tree. {e}")
+                try: tree.root_at_midpoint()
+                except: pass
+            
+            # Color mapping
+            for clade in tree.get_terminals():
+                cid = clade.name
+                day = id_to_day_map.get(cid, 0)
+                clade.custom_color = mcolors.to_hex(cmap(norm(day)))
+                
+            draw_tree_custom(ax, tree, title, color_attr='custom_color')
+        
+        # Add Colorbar (Common)
         sm = cm.ScalarMappable(cmap=cmap, norm=norm)
         sm.set_array([])
         cbar = fig.colorbar(sm, ax=ax, shrink=0.7, pad=0.04)
@@ -532,3 +583,6 @@ if __name__ == "__main__":
 # python /home1/oml4h/sim_test/evolve_deterministic.py --input_fasta /home1/oml4h/COG_UK_results/CAMBS/weekly_sequences_2021-12-06_to_2021-12-12.fasta --output_dir /home1/oml4h/sim_test/test_output/CAMBS --days 1000 --rate 2.7e-6 --downsample 30
 #   python /home1/oml4h/sim_test/evolve_deterministic.py --input_fasta /home1/oml4h/COG_UK_results/CAMBS/weekly_sequences_2022-01-10_to_2022-01-16.fasta --output_dir /home1/oml4h/sim_test/test_output/CAMBS/Jan --days 1000 --rate 2.7e-6 --downsample 30
 
+
+
+#python /home1/oml4h/sim_test/evolve_deterministic.py --input_fasta /home1/oml4h/sim_test/test_output/poly_a_sequences.fasta --output_dir /home1/oml4h/sim_test/test_output/polyA --days 1000 --rate 2.7e-6 --downsample 30
