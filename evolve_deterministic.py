@@ -188,7 +188,8 @@ def run_deterministic_evolution(
     output_dir: str,
     sim_days: int,
     mutation_rate_site_day: float,
-    downsample: int = -1
+    downsample: int = -1,
+    tree_samples: int = 200
 ):
     print("=" * 60)
     print("DETERMINISTIC EVOLUTION SIMULATION")
@@ -334,72 +335,48 @@ def run_deterministic_evolution(
 
     # 3. Final Analysis & Plotting
     print("\nGenerating final phylogeny...")
-    print("  Collecting sequences for tree (Final + 500 sampled history)...")
+    print(f"  Collecting {tree_samples} sequences for tree (sampled uniformly over time)...")
     
     records_for_tree = []
     id_to_day_map = {}
     
-    # A. Add Final Population
-    for i, (id_str, seq_list) in enumerate(zip(ids, current_sequences)):
-        # Make ID unique for tree
-        unique_id = f"{id_str}_day{sim_days}"
-        records_for_tree.append(SeqRecord(Seq("".join(seq_list)), id=unique_id))
-        id_to_day_map[unique_id] = sim_days
-        
-    # B. Sample Historical Population (200 samples)
-    if sim_days > 0:
-        samples_target = 200
-        # Create set of (day, seq_index) to sample
-        sample_points = set()
-        
-        # FORCE INCLUDE DAY 0 (Anchor)
-        # Ensure we have at least some day 0 sequences for rooting
-        # Add up to 5 sequences from Day 0
-        sequences_to_force = min(num_sequences, 5)
-        for s_idx in range(sequences_to_force):
-            sample_points.add((0, s_idx))
-        
-        # Fill remainder with random samples across timeline
-        max_sample_day = sim_days - 1
-        
-        if max_sample_day >= 0:
-            while len(sample_points) < samples_target + sequences_to_force: # approximate target
-                d = random.randint(0, max_sample_day)
-                s_idx = random.randint(0, num_sequences - 1)
-                sample_points.add((d, s_idx))
-                
-                # Safety break if we are struggling to find unique points (e.g. small matrix)
-                if len(sample_points) >= (num_sequences * (sim_days+1)): 
-                    break
-                if len(sample_points) > samples_target + 20: # Limit iterations
-                     break
+    # Sample uniformly
+    # Interval = sim_days / N
+    # We use linspace to get N points in [0, sim_days]
+    sample_days = np.linspace(0, sim_days, tree_samples, dtype=int)
+    
+    # We might have duplicates if tree_samples > sim_days
+    # Use counter to know how many to pick per day
+    day_counts = defaultdict(int)
+    for d in sample_days:
+        if d <= sim_days:
+            day_counts[d] += 1
             
-            # Group by day to efficient read
-            day_to_indices = defaultdict(list)
-            for d, s_idx in sample_points:
-                day_to_indices[d].append(s_idx)
+    print(f"  Sampling from {len(day_counts)} distinct timepoints...")
+
+    for d, count in sorted(day_counts.items()):
+        fname = os.path.join(daily_seq_dir, f"day_{d}.fasta")
+        if not os.path.exists(fname):
+             continue
+        
+        # Load file
+        day_records = list(SeqIO.parse(fname, "fasta"))
+        if not day_records: continue
+        
+        # Sample 'count' sequences randomly
+        if count > len(day_records):
+            selected = random.choices(day_records, k=count)
+        else:
+            selected = random.sample(day_records, count)
             
-            print(f"  Loading {len(sample_points)} historical sequences from {len(day_to_indices)} timepoints...")
-            
-            for d in sorted(day_to_indices.keys()):
-                indices_to_get = set(day_to_indices[d])
-                fname = os.path.join(daily_seq_dir, f"day_{d}.fasta")
-                if not os.path.exists(fname):
-                    continue
-                
-                # Load file
-                # If file is small, this is fast. If large, overhead.
-                day_records = list(SeqIO.parse(fname, "fasta"))
-                
-                for idx in indices_to_get:
-                    if idx < len(day_records):
-                        rec = day_records[idx]
-                        unique_id = f"{rec.id}_day{d}_{random.randint(1000,9999)}"
-                        rec.id = unique_id
-                        rec.name = unique_id
-                        rec.description = unique_id
-                        records_for_tree.append(rec)
-                        id_to_day_map[unique_id] = d
+        for rec in selected:
+            unique_id = f"{rec.id}_day{d}_{random.randint(1000,9999)}"
+            new_rec = SeqRecord(Seq(str(rec.seq)), id=unique_id, name=unique_id, description=unique_id)
+            records_for_tree.append(new_rec)
+            id_to_day_map[unique_id] = d
+    # But `tree_samples` is not defined yet.
+    # So I need to update the signature first.
+
 
     plot_final_tree(records_for_tree, id_to_day_map, sim_days, output_dir, mutation_rate_site_day)
     print(f"Done. Output in {output_dir}")
@@ -548,7 +525,10 @@ def plot_final_tree(records, id_to_day_map, max_day, output_dir, mutation_rate):
                 cid = clade.name
                 day = id_to_day_map.get(cid, 0)
                 clade.custom_color = mcolors.to_hex(cmap(norm(day)))
-                
+            
+            # Ladderize
+            tree.ladderize()
+            
             draw_tree_custom(ax, tree, title, color_attr='custom_color')
         
         # Add Colorbar (Common)
@@ -568,7 +548,8 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", required=True, help="Output directory")
     parser.add_argument("--days", type=int, default=100, help="Simulation days")
     parser.add_argument("--rate", type=float, default=2.7e-6, help="Mutations per site per day")
-    parser.add_argument("--downsample", type=int, default=-1, help="Downsample to N sequences (default: no downsampling)")
+    parser.add_argument("--downsample", type=int, default=-1, help="Downsample initial population to N sequences")
+    parser.add_argument("--tree_samples", type=int, default=200, help="Number of sequences to sample for final tree")
     
     args = parser.parse_args()
     
@@ -577,7 +558,8 @@ if __name__ == "__main__":
         args.output_dir, 
         args.days, 
         args.rate,
-        args.downsample
+        args.downsample,
+        args.tree_samples
     )
 # mkdir /home1/oml4h/sim_test_cam/output
 # python /home1/oml4h/sim_test/evolve_deterministic.py --input_fasta /home1/oml4h/COG_UK_results/CAMBS/weekly_sequences_2021-12-06_to_2021-12-12.fasta --output_dir /home1/oml4h/sim_test/test_output/CAMBS --days 1000 --rate 2.7e-6 --downsample 30
